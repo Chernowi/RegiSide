@@ -26,6 +26,8 @@ JOKERS_IN_DECK_CONST = {1: 0, 2: 0, 3: 1, 4: 2}
 class GameStatusEnum(Enum):
     WAITING_FOR_PLAYERS = "WAITING_FOR_PLAYERS"
     IN_PROGRESS = "IN_PROGRESS"
+    AWAITING_DEFENSE = "AWAITING_DEFENSE"
+    AWAITING_JESTER_CHOICE = "AWAITING_JESTER_CHOICE"
     WON = "WON"
     LOST = "LOST"
 
@@ -102,6 +104,10 @@ class GameRoom(Base):
     active_joker_cancels_immunity = Column(Boolean, default=False)
     consecutive_yields = Column(Integer, default=0)
     solo_jokers_available = Column(Integer, default=0) # For solo mode
+
+    damage_to_defend = Column(Integer, default=0) 
+    player_to_defend_id = Column(String, nullable=True)
+    jester_chooser_id = Column(String, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -213,12 +219,16 @@ def _assemble_game_state_dict(room: GameRoom, perspective_player_id: Optional[st
         "hospital_size": len(_deserialize_deck(room.hospital)),
         "current_enemy": room.current_enemy_str,
         "current_enemy_health": room.current_enemy_health,
-        "current_enemy_attack": current_enemy_effective_attack,
+        "current_enemy_attack": current_enemy_effective_attack, # This is the effective attack
+        "current_enemy_base_attack": room.current_enemy_base_attack, # Actual base attack of enemy
         "current_enemy_shield": room.current_enemy_shield,
         "current_player_id": room.player_order[room.current_player_idx] if room.player_order and room.current_player_idx < len(room.player_order) else None,
         "active_joker_cancels_immunity": room.active_joker_cancels_immunity,
         "consecutive_yields": room.consecutive_yields,
         "solo_jokers_available": room.solo_jokers_available if len(room.players) == 1 else None,
+        "damage_to_defend": room.damage_to_defend,
+        "player_to_defend_id": room.player_to_defend_id,
+        "jester_chooser_id": room.jester_chooser_id,
     }
 
 # --- Regicide Engine API Functions ---
@@ -433,11 +443,12 @@ def play_cards(room_code: str, player_id: str, card_strs_played_from_req: List[s
             room.hospital = _serialize_deck(hospital_list)
             
             player.hand = _serialize_deck(temp_hand_for_validation) # Update player's hand
-            # Joker play: Royal does not attack, turn advances.
-            _advance_turn(room)
-            room.consecutive_yields = 0
+            
+            room.status = GameStatusEnum.AWAITING_JESTER_CHOICE
+            room.jester_chooser_id = player.id
+            room.consecutive_yields = 0 # Reset yields as a play was made
             db.commit()
-            return True, f"Joker played by {player.player_name}. Immunity cancelled for {current_enemy_card}. Royal does not attack. Next player's turn."
+            return True, f"Joker played by {player.player_name}. Immunity cancelled for {current_enemy_card}. {player.player_name} must choose the next player."
 
         # Not a Joker play
         if len(played_cards_obj) == 1:
@@ -510,39 +521,13 @@ def play_cards(room_code: str, player_id: str, card_strs_played_from_req: List[s
         else:
             # --- Royal Attacks ---
             royal_attack_power = max(0, room.current_enemy_base_attack - room.current_enemy_shield)
-            player_hand_val_for_dmg = _deserialize_deck(player.hand) # Re-fetch current hand
             
-            # This part still requires player to choose cards for damage.
-            # For this engine, we'll assume the frontend will make another call if needed,
-            # or the engine auto-discards. For now, let's auto-discard.
-            player_hand_val_for_dmg.sort(key=lambda c: c.get_value(), reverse=True)
-            defense_value = 0
-            cards_discarded_for_damage: List[Card] = []
-            
-            final_hand_after_damage = player_hand_val_for_dmg[:] # Copy
-            for card_in_hand in player_hand_val_for_dmg:
-                if defense_value >= royal_attack_power: break
-                defense_value += card_in_hand.get_value()
-                cards_discarded_for_damage.append(card_in_hand)
-                # Find and remove one instance from final_hand_after_damage
-                for i_fh, fh_card in enumerate(final_hand_after_damage):
-                    if fh_card.to_str() == card_in_hand.to_str():
-                        final_hand_after_damage.pop(i_fh)
-                        break
-            
-            if defense_value < royal_attack_power:
-                room.status = GameStatusEnum.LOST
-                db.commit()
-                return False, f"Player {player.player_name} cannot withstand {current_enemy_card}'s attack of {royal_attack_power} (has {defense_value}). Game Over."
-            
-            player.hand = _serialize_deck(final_hand_after_damage)
-            hospital_list_after_attack = _deserialize_deck(room.hospital)
-            hospital_list_after_attack.extend(cards_discarded_for_damage)
-            room.hospital = _serialize_deck(hospital_list_after_attack)
-            
-            _advance_turn(room)
+            room.status = GameStatusEnum.AWAITING_DEFENSE
+            room.damage_to_defend = royal_attack_power
+            room.player_to_defend_id = player.id
+            # Turn does not advance here; it advances after successful defense or if game is lost.
             db.commit()
-            return True, f"{player.player_name} dealt {actual_damage_to_deal} damage. {current_enemy_card} has {room.current_enemy_health} HP. Royal attacked for {royal_attack_power}. {player.player_name} discarded {len(cards_discarded_for_damage)} cards. Next player's turn."
+            return True, f"{player.player_name} dealt {actual_damage_to_deal} damage. {current_enemy_card} has {room.current_enemy_health} HP. {player_name} must defend against {royal_attack_power} damage."
 
     except ValueError as ve: # Catch card parsing errors etc.
         db.rollback()
@@ -579,34 +564,14 @@ def yield_turn(room_code: str, player_id: str) -> Tuple[bool, Optional[str]]:
 
         # --- Royal Attacks (same logic as play_cards) ---
         royal_attack_power = max(0, room.current_enemy_base_attack - room.current_enemy_shield)
-        player_hand_cards = _deserialize_deck(player.hand)
-        player_hand_cards.sort(key=lambda c: c.get_value(), reverse=True)
-        defense_value = 0
-        cards_discarded_for_damage: List[Card] = []
-        final_hand_after_damage = player_hand_cards[:]
-
-        for card_in_hand in player_hand_cards:
-            if defense_value >= royal_attack_power: break
-            defense_value += card_in_hand.get_value()
-            cards_discarded_for_damage.append(card_in_hand)
-            for i_fh, fh_card in enumerate(final_hand_after_damage):
-                if fh_card.to_str() == card_in_hand.to_str():
-                    final_hand_after_damage.pop(i_fh)
-                    break
         
-        if defense_value < royal_attack_power:
-            room.status = GameStatusEnum.LOST
-            db.commit()
-            return False, f"Player {player.player_name} yielded and cannot withstand {current_enemy_card}'s attack of {royal_attack_power} (has {defense_value}). Game Over."
-        
-        player.hand = _serialize_deck(final_hand_after_damage)
-        hospital_list_yield = _deserialize_deck(room.hospital)
-        hospital_list_yield.extend(cards_discarded_for_damage)
-        room.hospital = _serialize_deck(hospital_list_yield)
-        
-        _advance_turn(room)
+        room.status = GameStatusEnum.AWAITING_DEFENSE
+        room.damage_to_defend = royal_attack_power
+        room.player_to_defend_id = player.id
+        # Turn does not advance here.
         db.commit()
-        return True, f"{player.player_name} yielded. Royal attacked for {royal_attack_power}. {player.player_name} discarded {len(cards_discarded_for_damage)} cards. Next player's turn."
+        return True, f"{player.player_name} yielded. {player.player_name} must defend against {royal_attack_power} damage."
+        
     except Exception as e:
         db.rollback()
         return False, f"Error during yield: {str(e)}"
@@ -651,6 +616,111 @@ def use_solo_joker_power(room_code: str, player_id: str) -> Tuple[bool, Optional
     except Exception as e:
         db.rollback()
         return False, f"Error using solo joker: {str(e)}"
+    finally:
+        next(db_gen, None)
+
+def defend_against_attack(room_code: str, player_id: str, card_strs_to_discard: List[str]) -> Tuple[bool, Optional[str]]:
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        room = _get_game_room(db, room_code)
+        if not room or room.status != GameStatusEnum.AWAITING_DEFENSE:
+            return False, "Game not in AWAITING_DEFENSE state or room not found."
+
+        if room.player_to_defend_id != player_id:
+            return False, "Not your turn to defend."
+
+        player = _get_player(db, player_id, room_code)
+        if not player:
+            return False, "Player not found in this room."
+
+        player_hand_cards = _deserialize_deck(player.hand)
+        cards_to_discard_obj: List[Card] = []
+        temp_hand_for_validation = player_hand_cards[:] # Copy for validation
+
+        for card_str_req in card_strs_to_discard:
+            card_to_discard = Card.from_str(card_str_req)
+            found_in_hand = False
+            for i, hand_card in enumerate(temp_hand_for_validation):
+                if hand_card.suit == card_to_discard.suit and hand_card.rank == card_to_discard.rank:
+                    cards_to_discard_obj.append(temp_hand_for_validation.pop(i))
+                    found_in_hand = True
+                    break
+            if not found_in_hand:
+                db.rollback() # Important: rollback if cards are invalid
+                return False, f"Card {card_str_req} not found in hand or already selected for discard."
+        
+        defense_value = sum(c.get_value() for c in cards_to_discard_obj)
+
+        if defense_value < room.damage_to_defend:
+            # Player chose cards but they are not enough. This is a loss.
+            # The rules state: "If a player cannot discard enough cards to satisfy the full damage amount, that player is eliminated, and all players lose the game immediately."
+            # This implies if they *can* but *choose* not to discard enough, it's also a loss if their choice is insufficient.
+            # For simplicity, we assume if they submit cards, they believe it's enough. If not, it's a loss.
+            # A more complex UI might allow them to re-select if their current selection is < required.
+            # Here, we assume the submitted cards are their final choice for this attempt.
+            room.status = GameStatusEnum.LOST
+            # Optionally, move the chosen (insufficient) cards to hospital anyway
+            player.hand = _serialize_deck(temp_hand_for_validation)
+            hospital_cards = _deserialize_deck(room.hospital)
+            hospital_cards.extend(cards_to_discard_obj)
+            room.hospital = _serialize_deck(hospital_cards)
+            db.commit()
+            return False, f"Player {player.player_name} failed to discard enough value ({defense_value}/{room.damage_to_defend}). Game Over."
+
+        # Sufficient defense
+        player.hand = _serialize_deck(temp_hand_for_validation) # Update hand
+        hospital_cards = _deserialize_deck(room.hospital)
+        hospital_cards.extend(cards_to_discard_obj)
+        room.hospital = _serialize_deck(hospital_cards)
+
+        room.damage_to_defend = 0
+        room.player_to_defend_id = None
+        room.status = GameStatusEnum.IN_PROGRESS
+        _advance_turn(room)
+        
+        db.commit()
+        discarded_names = ", ".join([c.to_str() for c in cards_to_discard_obj])
+        return True, f"{player.player_name} successfully defended by discarding {discarded_names}. Next player's turn."
+
+    except ValueError as ve:
+        db.rollback()
+        return False, f"Invalid card input: {str(ve)}"
+    except Exception as e:
+        db.rollback()
+        return False, f"Error during defense: {str(e)}"
+    finally:
+        next(db_gen, None)
+
+def choose_next_player_after_jester(room_code: str, jester_player_id: str, chosen_next_player_id: str) -> Tuple[bool, Optional[str]]:
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        room = _get_game_room(db, room_code)
+        if not room or room.status != GameStatusEnum.AWAITING_JESTER_CHOICE:
+            return False, "Game not awaiting Jester choice or room not found."
+
+        if room.jester_chooser_id != jester_player_id:
+            return False, "It's not your turn to choose the next player."
+
+        chosen_player_obj = _get_player(db, chosen_next_player_id, room_code)
+        if not chosen_player_obj:
+            return False, f"Chosen player {chosen_next_player_id} not found in this room."
+
+        try:
+            next_player_idx = room.player_order.index(chosen_next_player_id)
+        except ValueError:
+            return False, f"Chosen player {chosen_next_player_id} is not in the player order."
+
+        room.current_player_idx = next_player_idx
+        room.jester_chooser_id = None
+        room.status = GameStatusEnum.IN_PROGRESS
+        
+        db.commit()
+        return True, f"{chosen_player_obj.player_name}'s turn has been set by {jester_player_id}."
+    except Exception as e:
+        db.rollback()
+        return False, f"Error choosing next player: {str(e)}"
     finally:
         next(db_gen, None)
 

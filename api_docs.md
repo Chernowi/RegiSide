@@ -161,7 +161,7 @@ This document provides details for interacting with the Regicide Game API.
 
 *   **Endpoint:** `/play_cards`
 *   **Method:** `POST`
-*   **Description:** Allows the current player to play one or more cards from their hand to attack the enemy or use card powers.
+*   **Description:** Allows the current player to play one or more cards from their hand to attack the enemy or use card powers. If the enemy is not defeated and attacks, the game state will transition to `AWAITING_DEFENSE`. If a Jester is played, the game state will transition to `AWAITING_JESTER_CHOICE`.
 *   **Request Body:**
     ```json
     {
@@ -176,7 +176,7 @@ This document provides details for interacting with the Regicide Game API.
     {
       "status": "success",
       "data": { /* Game State Object */ },
-      "message": "Action message (e.g., 'Cards played successfully.', 'Enemy defeated!', 'Game Over!')"
+      "message": "Action message (e.g., 'Cards played successfully.', 'Enemy defeated!', 'Player must defend.', 'Jester played, choose next player.', 'Game Over!')"
     }
     ```
 *   **Error Responses:**
@@ -189,7 +189,7 @@ This document provides details for interacting with the Regicide Game API.
 
 *   **Endpoint:** `/yield_turn`
 *   **Method:** `POST`
-*   **Description:** Allows the current player to yield their turn. The enemy will attack.
+*   **Description:** Allows the current player to yield their turn. The enemy will attack, and the game state will transition to `AWAITING_DEFENSE`.
 *   **Request Body:**
     ```json
     {
@@ -203,16 +203,70 @@ This document provides details for interacting with the Regicide Game API.
     {
       "status": "success",
       "data": { /* Game State Object */ },
-      "message": "Action message (e.g., 'Turn yielded. Royal attacked... Next player's turn.')"
+      "message": "Action message (e.g., 'Turn yielded. Player must defend against X damage.')"
     }
     ```
 *   **Error Responses:**
-    *   `400 Bad Request`: Not player's turn, game not in progress.
-    *   If the game ends (e.g., player cannot absorb damage, all players yield), message and status will reflect this.
+    *   `400 Bad Request`: Not player's turn, game not in progress, cannot yield.
+    *   If all players yield consecutively, game ends.
 
 ---
 
-### 8. Use Solo Joker Power (Solo Mode Only)
+### 8. Defend Against Attack
+
+*   **Endpoint:** `/defend`
+*   **Method:** `POST`
+*   **Description:** Allows the player designated by `player_to_defend_id` to discard cards from their hand to absorb damage. This is called when game status is `AWAITING_DEFENSE`.
+*   **Request Body:**
+    ```json
+    {
+      "room_code": "string",
+      "player_id": "string (ID of the player who needs to defend)",
+      "cards": ["string", "string", ...] // List of card strings to discard for defense
+    }
+    ```
+*   **Success Response (200 OK):**
+    Returns the updated game state object. If defense is successful, status becomes `IN_PROGRESS` and turn advances. If defense fails, status becomes `LOST`.
+    ```json
+    {
+      "status": "success",
+      "data": { /* Game State Object */ },
+      "message": "Defense successful. Next player's turn." // or "Failed to defend. Game Over."
+    }
+    ```
+*   **Error Responses:**
+    *   `400 Bad Request`: Not in `AWAITING_DEFENSE` state, wrong player, cards not in hand, insufficient discard value leading to game loss.
+
+---
+
+### 9. Choose Next Player (After Jester)
+
+*   **Endpoint:** `/choose_next_player`
+*   **Method:** `POST`
+*   **Description:** Allows the player who played a Jester (identified by `jester_chooser_id`) to choose the next player. This is called when game status is `AWAITING_JESTER_CHOICE`.
+*   **Request Body:**
+    ```json
+    {
+      "room_code": "string",
+      "player_id": "string (ID of the player who played the Jester)",
+      "chosen_player_id": "string (ID of the player to take the next turn)"
+    }
+    ```
+*   **Success Response (200 OK):**
+    Returns the updated game state object. Status becomes `IN_PROGRESS` and `current_player_id` is updated.
+    ```json
+    {
+      "status": "success",
+      "data": { /* Game State Object */ },
+      "message": "Next player chosen successfully. [Chosen Player Name]'s turn."
+    }
+    ```
+*   **Error Responses:**
+    *   `400 Bad Request`: Not in `AWAITING_JESTER_CHOICE` state, wrong player choosing, invalid chosen player.
+
+---
+
+### 10. Use Solo Joker Power (Solo Mode Only)
 
 *   **Endpoint:** `/use_solo_joker`
 *   **Method:** `POST`
@@ -246,7 +300,7 @@ The game state object is returned by several endpoints and represents the curren
 {
   "room_code": "string",
   "created_by_player_id": "string (ID of the player who created the room)", // If available
-  "status": "string (Enum: WAITING_FOR_PLAYERS, IN_PROGRESS, WON, LOST)",
+  "status": "string (Enum: WAITING_FOR_PLAYERS, IN_PROGRESS, AWAITING_DEFENSE, AWAITING_JESTER_CHOICE, WON, LOST)",
   "players": [
     {
       "id": "string",
@@ -263,8 +317,12 @@ The game state object is returned by several endpoints and represents the curren
   "current_enemy": "string (e.g., 'SJ' for Jack of Spades, null if no enemy)",
   "current_enemy_health": "integer",
   "current_enemy_attack": "integer (effective attack after shield)",
+  "current_enemy_base_attack": "integer (base attack of the enemy before shield)",
   "current_enemy_shield": "integer (damage reduction from Spades)",
-  "current_player_id": "string (ID of the player whose turn it is, null if game not started/over)",
+  "current_player_id": "string (ID of the player whose turn it is, null if game not started/over or if an action is pending from another player)",
+  "player_to_defend_id": "string (ID of player who needs to discard cards for defense, null otherwise)",
+  "damage_to_defend": "integer (Amount of damage the player_to_defend_id needs to absorb, 0 otherwise)",
+  "jester_chooser_id": "string (ID of player who played a Jester and needs to choose next player, null otherwise)",
   "active_joker_cancels_immunity": "boolean",
   "consecutive_yields": "integer",
   "solo_jokers_available": "integer (or null if not a solo game)",

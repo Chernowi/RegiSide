@@ -177,6 +177,53 @@ def route_yield_turn():
 
     return success_response(current_game_state, message)
 
+@app.route('/api/defend', methods=['POST'])
+def route_defend():
+    data = request.json
+    room_code = data.get('room_code')
+    player_id = data.get('player_id')
+    cards_to_discard = data.get('cards') # List of card strings
+
+    if not all([room_code, player_id, isinstance(cards_to_discard, list)]):
+        return error_response("room_code, player_id, and a list of cards are required.", 400)
+
+    action_successful, message = engine.defend_against_attack(room_code, player_id, cards_to_discard)
+
+    current_game_state, state_error = engine.get_game_state(room_code, perspective_player_id=player_id)
+    if state_error:
+        if action_successful and ("Game Over" in message or "win" in message or "lost" in message): # Game might have ended
+             return success_response({"game_over_message": message, "final_state_fetch_error": state_error}, message)
+        return error_response(f"Action processed with message '{message}', but failed to fetch updated game state: {state_error}", 500)
+
+    if not action_successful:
+         # If game ended due to failed defense, message will indicate "Game Over"
+        return error_response(message, 400, data=current_game_state) 
+
+    return success_response(current_game_state, message)
+
+@app.route('/api/choose_next_player', methods=['POST'])
+def route_choose_next_player():
+    data = request.json
+    room_code = data.get('room_code')
+    jester_player_id = data.get('player_id') # The player who played the Jester
+    chosen_next_player_id = data.get('chosen_player_id')
+
+    if not all([room_code, jester_player_id, chosen_next_player_id]):
+        return error_response("room_code, player_id (of jester player), and chosen_player_id are required.", 400)
+
+    action_successful, message = engine.choose_next_player_after_jester(room_code, jester_player_id, chosen_next_player_id)
+
+    # Fetch state from perspective of the jester player or the newly chosen player?
+    # For consistency, let's use jester_player_id for now.
+    current_game_state, state_error = engine.get_game_state(room_code, perspective_player_id=jester_player_id)
+    if state_error:
+        return error_response(f"Action processed with message '{message}', but failed to fetch updated game state: {state_error}", 500)
+
+    if not action_successful:
+        return error_response(message, 400, data=current_game_state)
+
+    return success_response(current_game_state, message)
+
 @app.route('/api/use_solo_joker', methods=['POST'])
 def route_use_solo_joker():
     data = request.json
