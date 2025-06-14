@@ -204,6 +204,7 @@ def _assemble_game_state_dict(room: GameRoom, perspective_player_id: Optional[st
 
     return {
         "room_code": room.room_code,
+        "created_by_player_id": room.created_by_player_id, # Add this line
         "status": room.status.name,
         "players": players_info, # Using fetched player objects
         "player_order": room.player_order,
