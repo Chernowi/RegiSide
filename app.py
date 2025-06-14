@@ -1,9 +1,24 @@
 import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from werkzeug.exceptions import NotFound
 
-# Assuming your game logic is in 'regicide_engine.py'
-import regicide_engine as engine
+# Import your models and engine functions
+from regicide_engine import (
+    get_player_by_token,
+    create_player,
+    get_game,
+    create_game_db,
+    update_game_db,
+    get_game_state_for_player,
+    Game,
+    Player,
+    initialize_database # Import the initialize_database function
+)
+
+# Call initialize_database() when the app module is loaded.
+# This will ensure tables are created if they don't exist when the app starts.
+initialize_database()
 
 app = Flask(__name__)
 
