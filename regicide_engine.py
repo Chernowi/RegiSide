@@ -235,6 +235,7 @@ def _assemble_game_state_dict(room: GameRoom, perspective_player_id: Optional[st
         "tavern_deck_size": len(_deserialize_deck(room.tavern_deck)),
         "castle_deck_size": len(_deserialize_deck(room.castle_deck)),
         "hospital_size": len(_deserialize_deck(room.hospital)),
+        "hospital_cards": room.hospital, # NEW: Add the list of card strings from the hospital
         "current_enemy": room.current_enemy_str,
         "current_enemy_health": room.current_enemy_health,
         "current_enemy_attack": current_enemy_effective_attack, # This is the effective attack

@@ -314,6 +314,7 @@ The game state object is returned by several endpoints and represents the curren
   "tavern_deck_size": "integer",
   "castle_deck_size": "integer",
   "hospital_size": "integer (discard pile)",
+  "hospital_cards": ["string", ...], // NEW: List of cards in the discard pile (e.g., ["H5", "S10", "CA"])
   "current_enemy": "string (e.g., 'SJ' for Jack of Spades, null if no enemy)",
   "current_enemy_health": "integer",
   "current_enemy_attack": "integer (effective attack after shield)",
