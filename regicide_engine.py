@@ -1,612 +1,714 @@
+import os
 import random
 import uuid
-from enum import Enum, auto
+from enum import Enum
 from typing import List, Dict, Optional, Tuple, Any
+
+from sqlalchemy import create_engine, Column, String, Integer, Boolean, JSON, ForeignKey, DateTime, Enum as SQLAEnum, inspect
+from sqlalchemy.orm import sessionmaker, Session, relationship, declarative_base
+from sqlalchemy.sql import func
+from sqlalchemy.dialects.postgresql import JSONB # Use JSONB for PostgreSQL
 
 # --- Constants ---
 SUITS = ["H", "D", "S", "C"]  # Hearts, Diamonds, Spades, Clubs
 RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
-JOKER_RANK = "X" # Using X for Joker rank to distinguish
+JOKER_RANK = "X"
 
-MAX_PLAYERS = 4
-MIN_PLAYERS = 1
+MAX_PLAYERS_CONST = 4 # Renamed to avoid conflict
+MIN_PLAYERS_CONST = 1
 
-ROYAL_HEALTH = {"J": 20, "Q": 30, "K": 40}
-ROYAL_ATTACK = {"J": 10, "Q": 15, "K": 20}
+ROYAL_HEALTH_CONST = {"J": 20, "Q": 30, "K": 40}
+ROYAL_ATTACK_CONST = {"J": 10, "Q": 15, "K": 20}
 
-# Hand sizes per player count
-HAND_SIZES = {
-    1: 8,
-    2: 7,
-    3: 6,
-    4: 5,
-}
+HAND_SIZES_CONST = {1: 8, 2: 7, 3: 6, 4: 5}
+JOKERS_IN_DECK_CONST = {1: 0, 2: 0, 3: 1, 4: 2}
 
-# Jokers in Tavern Deck per player count
-JOKERS_IN_DECK = {
-    1: 0, # Solo jokers are special
-    2: 0,
-    3: 1,
-    4: 2,
-}
+class GameStatusEnum(Enum):
+    WAITING_FOR_PLAYERS = "WAITING_FOR_PLAYERS"
+    IN_PROGRESS = "IN_PROGRESS"
+    WON = "WON"
+    LOST = "LOST"
 
+# --- Card Class & Utilities (essential for game logic) ---
 class Card:
     def __init__(self, suit: Optional[str], rank: str):
-        self.suit = suit # None for Joker
+        self.suit = suit
         self.rank = rank
 
     def __repr__(self):
         return f"{self.rank}{self.suit if self.suit else ''}"
 
-    def get_value(self, for_attack=False) -> int:
-        if self.rank == JOKER_RANK:
-            return 0 # Jokers have 0 value for absorbing damage, no attack value on their own
-        if self.rank == "A":
-            return 1
-        if self.rank.isdigit():
-            return int(self.rank)
-        if self.rank == "J":
-            return 10 if not for_attack else ROYAL_ATTACK["J"] # Attack value is different if it's the enemy
-        if self.rank == "Q":
-            return 15 if not for_attack else ROYAL_ATTACK["Q"]
-        if self.rank == "K":
-            return 20 if not for_attack else ROYAL_ATTACK["K"]
+    def to_str(self) -> str:
+        return str(self)
+
+    @classmethod
+    def from_str(cls, card_str: str) -> 'Card':
+        if not card_str: return None # Handle empty string if it occurs
+        if card_str.upper() == JOKER_RANK:
+            return cls(None, JOKER_RANK)
+        if len(card_str) < 2: raise ValueError(f"Invalid card string format: {card_str}")
+        rank = card_str[:-1].upper()
+        suit = card_str[-1:].upper()
+        if suit not in SUITS or rank not in RANKS: # Joker should be caught by the first condition
+            raise ValueError(f"Invalid card string components: {card_str}")
+        return cls(suit, rank)
+
+    def get_value(self) -> int: # Value for discarding/absorbing damage
+        if self.rank == JOKER_RANK: return 0
+        if self.rank == "A": return 1
+        if self.rank.isdigit(): return int(self.rank)
+        if self.rank == "J": return 10
+        if self.rank == "Q": return 15
+        if self.rank == "K": return 20
         return 0
 
     def get_attack_power(self) -> int: # Attack power when played from hand
         if self.rank == "A": return 1
         if self.rank.isdigit(): return int(self.rank)
-        if self.rank == "J": return 10 # J, Q, K from hand have fixed attack values
+        if self.rank == "J": return 10
         if self.rank == "Q": return 15
         if self.rank == "K": return 20
         return 0 # Joker doesn't attack directly
 
-class GameStatus(Enum):
-    WAITING_FOR_PLAYERS = auto()
-    IN_PROGRESS = auto()
-    WON = auto()
-    LOST = auto()
+# --- SQLAlchemy Setup ---
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    print("WARNING: DATABASE_URL environment variable not set. Using in-memory SQLite for now (not persistent).")
+    DATABASE_URL = "sqlite:///:memory:" # Fallback for local testing if no DB_URL
 
-class Player:
-    def __init__(self, player_id: str, player_name: str):
-        self.id: str = player_id
-        self.name: str = player_name
-        self.hand: List[Card] = []
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-    def __repr__(self):
-        return f"Player({self.name}, Hand: {self.hand})"
+# --- Database Models ---
+class GameRoom(Base):
+    __tablename__ = "game_rooms"
 
-class GameState:
-    def __init__(self, room_code: str, created_by: str):
-        self.room_code: str = room_code
-        self.players: Dict[str, Player] = {} # player_id -> Player object
-        self.player_order: List[str] = [] # List of player_ids in turn order
-        self.status: GameStatus = GameStatus.WAITING_FOR_PLAYERS
-        self.created_by: str = created_by # player_id of creator
+    room_code = Column(String, primary_key=True, index=True)
+    status = Column(SQLAEnum(GameStatusEnum), default=GameStatusEnum.WAITING_FOR_PLAYERS)
+    created_by_player_id = Column(String, nullable=False) # ID of the player who created the room
+    current_player_idx = Column(Integer, default=0)
+    player_order = Column(JSONB, default=list) # List of player_ids in turn order
 
-        self.tavern_deck: List[Card] = []
-        self.castle_deck: List[Card] = []
-        self.hospital: List[Card] = [] # Discard pile
+    tavern_deck = Column(JSONB, default=list)  # List of card strings
+    castle_deck = Column(JSONB, default=list)  # List of card strings
+    hospital = Column(JSONB, default=list)     # List of card strings
 
-        self.current_enemy: Optional[Card] = None
-        self.current_enemy_health: int = 0
-        self.current_enemy_base_attack: int = 0 # Base attack of the current enemy
-        self.current_enemy_shield: int = 0 # Damage reduction from Spades
+    current_enemy_str = Column(String, nullable=True)
+    current_enemy_health = Column(Integer, default=0)
+    current_enemy_base_attack = Column(Integer, default=0) # Base attack, shield is subtracted from this
+    current_enemy_shield = Column(Integer, default=0)
 
-        self.current_player_idx: int = 0
-        self.active_joker_cancels_immunity: bool = False
-        self.consecutive_yields: int = 0
+    active_joker_cancels_immunity = Column(Boolean, default=False)
+    consecutive_yields = Column(Integer, default=0)
+    solo_jokers_available = Column(Integer, default=0) # For solo mode
 
-        # Solo mode specific
-        self.solo_jokers_available: int = 2 if len(self.players) == 1 and MIN_PLAYERS == 1 else 0
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    def get_player(self, player_id: str) -> Optional[Player]:
-        return self.players.get(player_id)
+    players = relationship("Player", back_populates="room", cascade="all, delete-orphan")
 
-    def get_current_player(self) -> Optional[Player]:
-        if not self.player_order:
-            return None
-        return self.players.get(self.player_order[self.current_player_idx])
+class Player(Base):
+    __tablename__ = "players"
 
-    def to_dict(self, perspective_player_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Returns a dictionary representation of the game state.
-        Hides other players' hands if perspective_player_id is provided.
-        """
-        players_info = []
-        for pid, player in self.players.items():
-            if perspective_player_id == pid:
-                players_info.append({"id": pid, "name": player.name, "hand": [str(c) for c in player.hand], "hand_size": len(player.hand)})
-            else:
-                players_info.append({"id": pid, "name": player.name, "hand_size": len(player.hand)})
+    id = Column(String, primary_key=True, index=True) # Globally unique player ID (e.g., from auth system or session)
+    room_code = Column(String, ForeignKey("game_rooms.room_code"), nullable=False, index=True)
+    player_name = Column(String, nullable=False)
+    hand = Column(JSONB, default=list) # List of card strings
 
+    room = relationship("GameRoom", back_populates="players")
 
-        return {
-            "room_code": self.room_code,
-            "status": self.status.name,
-            "players": players_info,
-            "player_order": self.player_order,
-            "tavern_deck_size": len(self.tavern_deck),
-            "castle_deck_size": len(self.castle_deck),
-            "hospital_size": len(self.hospital),
-            "current_enemy": str(self.current_enemy) if self.current_enemy else None,
-            "current_enemy_health": self.current_enemy_health,
-            "current_enemy_attack": max(0, self.current_enemy_base_attack - self.current_enemy_shield),
-            "current_enemy_shield": self.current_enemy_shield,
-            "current_player_id": self.player_order[self.current_player_idx] if self.player_order else None,
-            "active_joker_cancels_immunity": self.active_joker_cancels_immunity,
-            "consecutive_yields": self.consecutive_yields,
-            "solo_jokers_available": self.solo_jokers_available if len(self.players)==1 else None,
-        }
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-# --- Global Game Storage (In-memory, replace with DB for persistence) ---
-games: Dict[str, GameState] = {}
+def initialize_database():
+    """Creates all tables in the database."""
+    Base.metadata.create_all(bind=engine)
+    print("Database tables created/ensured.")
 
-# --- Helper Functions ---
-def _create_deck() -> List[Card]:
-    deck = [Card(suit, rank) for suit in SUITS for rank in RANKS if rank not in ["J", "Q", "K"]]
-    return deck
+# --- Database Session Management ---
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-def _create_castle_deck() -> List[Card]:
+# --- Helper Functions for DB Interaction and Game State ---
+def _serialize_deck(deck: List[Card]) -> List[str]:
+    return [card.to_str() for card in deck]
+
+def _deserialize_deck(deck_str: List[str]) -> List[Card]:
+    return [Card.from_str(cs) for cs in deck_str if cs] # Ensure cs is not empty
+
+def _get_game_room(db: Session, room_code: str) -> Optional[GameRoom]:
+    return db.query(GameRoom).filter(GameRoom.room_code == room_code).first()
+
+def _get_player(db: Session, player_id: str, room_code: str = None) -> Optional[Player]:
+    query = db.query(Player).filter(Player.id == player_id)
+    if room_code:
+        query = query.filter(Player.room_code == room_code)
+    return query.first()
+
+def _get_current_player_obj(room: GameRoom, db: Session) -> Optional[Player]:
+    if not room.player_order or room.current_player_idx >= len(room.player_order):
+        return None
+    current_player_id = room.player_order[room.current_player_idx]
+    return _get_player(db, current_player_id, room.room_code)
+
+def _create_standard_deck() -> List[Card]:
+    return [Card(suit, rank) for suit in SUITS for rank in RANKS if rank not in ["J", "Q", "K"]]
+
+def _create_castle_deck_cards() -> List[Card]:
     jacks = [Card(s, "J") for s in SUITS]
     queens = [Card(s, "Q") for s in SUITS]
     kings = [Card(s, "K") for s in SUITS]
     random.shuffle(jacks)
     random.shuffle(queens)
     random.shuffle(kings)
-    return jacks + queens + kings # Jacks on top, then Queens, then Kings
+    return jacks + queens + kings
 
-def _get_card_from_str(card_str: str) -> Card:
-    """Converts a string like 'H10' or 'SJ' or 'X' (for Joker) to a Card object."""
-    if card_str.upper() == JOKER_RANK:
-        return Card(None, JOKER_RANK)
-    rank = card_str[:-1]
-    suit = card_str[-1:].upper()
-    if suit not in SUITS or rank not in RANKS:
-        raise ValueError(f"Invalid card string: {card_str}")
-    return Card(suit, rank)
-
-def _deal_cards(game: GameState):
-    num_players = len(game.players)
+def _deal_cards_to_players(room: GameRoom, db: Session):
+    num_players = len(room.players)
     if not num_players: return
 
-    max_hand = HAND_SIZES.get(num_players, 5) # Default to 5 if somehow out of range
-    for _ in range(max_hand):
-        for player_id in game.player_order:
-            player = game.players[player_id]
-            if len(player.hand) < max_hand and game.tavern_deck:
-                player.hand.append(game.tavern_deck.pop())
+    max_hand_size = HAND_SIZES_CONST.get(num_players, 5)
+    tavern_deck_cards = _deserialize_deck(room.tavern_deck)
 
-# --- API Functions ---
+    for _ in range(max_hand_size): # Iterate for max hand size rounds
+        for player_id_in_order in room.player_order:
+            player_obj = _get_player(db, player_id_in_order, room.room_code)
+            if player_obj:
+                player_hand_cards = _deserialize_deck(player_obj.hand)
+                if len(player_hand_cards) < max_hand_size and tavern_deck_cards:
+                    card_to_deal = tavern_deck_cards.pop(0) # Take from top
+                    player_hand_cards.append(card_to_deal)
+                    player_obj.hand = _serialize_deck(player_hand_cards) # Update DB field
+    room.tavern_deck = _serialize_deck(tavern_deck_cards) # Update DB field
+
+def _assemble_game_state_dict(room: GameRoom, perspective_player_id: Optional[str] = None) -> Dict[str, Any]:
+    if not room: return None
+
+    players_info = []
+    for p_obj in room.players: # Iterate over Player objects in the relationship
+        player_hand_cards = _deserialize_deck(p_obj.hand)
+        player_data = {"id": p_obj.id, "name": p_obj.player_name, "hand_size": len(player_hand_cards)}
+        if perspective_player_id == p_obj.id:
+            player_data["hand"] = [card.to_str() for card in player_hand_cards]
+        players_info.append(player_data)
+
+    current_enemy_card = Card.from_str(room.current_enemy_str) if room.current_enemy_str else None
+    current_enemy_effective_attack = 0
+    if current_enemy_card:
+        current_enemy_effective_attack = max(0, room.current_enemy_base_attack - room.current_enemy_shield)
+
+
+    return {
+        "room_code": room.room_code,
+        "status": room.status.name,
+        "players": players_info, # Using fetched player objects
+        "player_order": room.player_order,
+        "tavern_deck_size": len(_deserialize_deck(room.tavern_deck)),
+        "castle_deck_size": len(_deserialize_deck(room.castle_deck)),
+        "hospital_size": len(_deserialize_deck(room.hospital)),
+        "current_enemy": room.current_enemy_str,
+        "current_enemy_health": room.current_enemy_health,
+        "current_enemy_attack": current_enemy_effective_attack,
+        "current_enemy_shield": room.current_enemy_shield,
+        "current_player_id": room.player_order[room.current_player_idx] if room.player_order and room.current_player_idx < len(room.player_order) else None,
+        "active_joker_cancels_immunity": room.active_joker_cancels_immunity,
+        "consecutive_yields": room.consecutive_yields,
+        "solo_jokers_available": room.solo_jokers_available if len(room.players) == 1 else None,
+    }
+
+# --- Regicide Engine API Functions ---
 
 def create_room(player_id: str, player_name: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Creates a new game room.
-    Returns (room_code, error_message).
-    """
-    room_code = str(uuid.uuid4())[:6].upper() # Simple room code
-    while room_code in games:
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
         room_code = str(uuid.uuid4())[:6].upper()
+        while _get_game_room(db, room_code):
+            room_code = str(uuid.uuid4())[:6].upper()
 
-    game = GameState(room_code, player_id)
-    games[room_code] = game
-    # Automatically join the creator
-    success, error = join_room(room_code, player_id, player_name)
-    if not success:
-        del games[room_code] # Clean up if join fails (shouldn't happen here)
-        return None, error
-    return room_code, None
+        new_room = GameRoom(room_code=room_code, created_by_player_id=player_id, status=GameStatusEnum.WAITING_FOR_PLAYERS)
+        db.add(new_room)
+        db.commit() # Commit room first to satisfy foreign key for player
+
+        # Automatically join the creator
+        success, error = join_room(room_code, player_id, player_name) # join_room will handle its own db session
+        if not success:
+            db.delete(new_room) # Clean up room if join fails (should be rare)
+            db.commit()
+            return None, f"Failed to add creator to room: {error}"
+
+        return room_code, None
+    except Exception as e:
+        db.rollback()
+        return None, f"Database error creating room: {str(e)}"
+    finally:
+        next(db_gen, None) # Close session
+
 
 def join_room(room_code: str, player_id: str, player_name: str) -> Tuple[bool, Optional[str]]:
-    """
-    Adds a player to an existing game room.
-    Returns (success_boolean, error_message).
-    """
-    game = games.get(room_code)
-    if not game:
-        return False, "Room not found."
-    if game.status != GameStatus.WAITING_FOR_PLAYERS:
-        return False, "Game has already started."
-    if len(game.players) >= MAX_PLAYERS:
-        return False, "Room is full."
-    if player_id in game.players:
-        return False, "Player already in room." # Or allow reconnect logic
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        room = _get_game_room(db, room_code)
+        if not room:
+            return False, "Room not found."
+        if room.status != GameStatusEnum.WAITING_FOR_PLAYERS:
+            return False, "Game has already started or finished."
+        if len(room.players) >= MAX_PLAYERS_CONST:
+            return False, "Room is full."
 
-    game.players[player_id] = Player(player_id, player_name)
-    game.player_order.append(player_id) # Add to order
-    return True, None
+        existing_player = _get_player(db, player_id, room_code)
+        if existing_player:
+            # Optionally, update name or just confirm rejoining waiting room
+            existing_player.player_name = player_name # Update name if rejoining
+            # return True, "Player already in room. Details updated." # Or specific reconnect logic
+        else:
+            new_player = Player(id=player_id, room_code=room_code, player_name=player_name, hand=[])
+            db.add(new_player)
+        
+        # Update player_order if not already there
+        current_player_order = list(room.player_order) # Make a mutable copy
+        if player_id not in current_player_order:
+            current_player_order.append(player_id)
+            room.player_order = current_player_order # Assign back to trigger SQLAlchemy change detection
+
+        db.commit()
+        return True, None
+    except Exception as e:
+        db.rollback()
+        return False, f"Database error joining room: {str(e)}"
+    finally:
+        next(db_gen, None)
 
 def get_game_state(room_code: str, perspective_player_id: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Retrieves the current state of the game.
-    Returns (game_state_dict, error_message).
-    """
-    game = games.get(room_code)
-    if not game:
-        return None, "Room not found."
-    return game.to_dict(perspective_player_id), None
-
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        room = _get_game_room(db, room_code)
+        if not room:
+            return None, "Room not found."
+        return _assemble_game_state_dict(room, perspective_player_id), None
+    except Exception as e:
+        # No rollback needed for read operation
+        return None, f"Error fetching game state: {str(e)}"
+    finally:
+        next(db_gen, None)
 
 def start_game(room_code: str, requesting_player_id: str) -> Tuple[bool, Optional[str]]:
-    """
-    Starts the game if conditions are met.
-    Returns (success_boolean, error_message).
-    """
-    game = games.get(room_code)
-    if not game:
-        return False, "Room not found."
-    if game.created_by != requesting_player_id:
-        return False, "Only the room creator can start the game."
-    if game.status != GameStatus.WAITING_FOR_PLAYERS:
-        return False, "Game already started or finished."
-    if len(game.players) < MIN_PLAYERS:
-        return False, f"Not enough players. Need at least {MIN_PLAYERS}."
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        room = _get_game_room(db, room_code)
+        if not room: return False, "Room not found."
+        if room.created_by_player_id != requesting_player_id: return False, "Only the room creator can start the game."
+        if room.status != GameStatusEnum.WAITING_FOR_PLAYERS: return False, "Game already started or finished."
+        if len(room.players) < MIN_PLAYERS_CONST: return False, f"Not enough players. Need at least {MIN_PLAYERS_CONST}."
 
-    # Initialize Decks
-    game.castle_deck = _create_castle_deck()
-    game.tavern_deck = _create_deck()
+        room.castle_deck = _serialize_deck(_create_castle_deck_cards())
+        
+        tavern_cards = _create_standard_deck()
+        num_jokers_to_add = JOKERS_IN_DECK_CONST.get(len(room.players), 0)
+        for _ in range(num_jokers_to_add):
+            tavern_cards.append(Card(None, JOKER_RANK))
+        random.shuffle(tavern_cards)
+        room.tavern_deck = _serialize_deck(tavern_cards)
+        
+        room.hospital = [] # Clear hospital
+        room.current_player_idx = 0 # Creator (usually first in order) starts
+        random.shuffle(room.player_order) # Shuffle player order at game start
 
-    num_jokers_to_add = JOKERS_IN_DECK.get(len(game.players), 0)
-    for _ in range(num_jokers_to_add):
-        game.tavern_deck.append(Card(None, JOKER_RANK))
+        # Solo mode Jokers
+        if len(room.players) == 1:
+            room.solo_jokers_available = 2
+        else:
+            room.solo_jokers_available = 0
 
-    random.shuffle(game.tavern_deck)
+        _deal_cards_to_players(room, db) # This will modify room.tavern_deck and player hands
 
-    # Solo mode Jokers
-    if len(game.players) == 1:
-        game.solo_jokers_available = 2 # These are separate from deck jokers
+        # Set up first enemy
+        castle_deck_cards = _deserialize_deck(room.castle_deck)
+        if not castle_deck_cards:
+            room.status = GameStatusEnum.LOST # Or an error state
+            db.commit()
+            return False, "Error: Castle deck empty at start."
 
-    # Deal Cards
-    _deal_cards(game)
+        first_enemy_card = castle_deck_cards.pop(0)
+        room.castle_deck = _serialize_deck(castle_deck_cards) # Update deck
+        room.current_enemy_str = first_enemy_card.to_str()
+        room.current_enemy_health = ROYAL_HEALTH_CONST[first_enemy_card.rank]
+        room.current_enemy_base_attack = ROYAL_ATTACK_CONST[first_enemy_card.rank]
+        room.current_enemy_shield = 0
+        room.active_joker_cancels_immunity = False
+        room.consecutive_yields = 0
+        room.status = GameStatusEnum.IN_PROGRESS
+        
+        db.commit()
+        return True, None
+    except Exception as e:
+        db.rollback()
+        return False, f"Database error starting game: {str(e)}"
+    finally:
+        next(db_gen, None)
 
-    # Set up first enemy
-    if not game.castle_deck:
-        game.status = GameStatus.WON # Should not happen with a full castle deck
-        return False, "Error: Castle deck empty at start."
+def _advance_turn(room: GameRoom):
+    room.current_player_idx = (room.current_player_idx + 1) % len(room.player_order)
 
-    game.current_enemy = game.castle_deck.pop(0) # Draw from the top (Jacks first)
-    game.current_enemy_health = ROYAL_HEALTH[game.current_enemy.rank]
-    game.current_enemy_base_attack = ROYAL_ATTACK[game.current_enemy.rank]
-    game.current_enemy_shield = 0
-    game.active_joker_cancels_immunity = False
-
-    game.status = GameStatus.IN_PROGRESS
-    game.current_player_idx = 0 # First player in order starts
-    game.consecutive_yields = 0
-
-    return True, None
-
-def _advance_turn(game: GameState):
-    game.current_player_idx = (game.current_player_idx + 1) % len(game.players)
-
-def _check_game_over(game: GameState) -> bool:
-    if game.status == GameStatus.WON or game.status == GameStatus.LOST:
-        return True
-    return False
-
-def _handle_enemy_defeat(game: GameState, overkill: bool):
-    defeated_enemy = game.current_enemy
-    game.current_enemy = None # Clear current enemy
-    game.active_joker_cancels_immunity = False # Reset joker effect
-
+def _handle_enemy_defeat(room: GameRoom, overkill: bool, defeated_enemy_card: Card, db: Session):
+    hospital_cards = _deserialize_deck(room.hospital)
     if overkill:
-        game.hospital.append(defeated_enemy)
+        hospital_cards.append(defeated_enemy_card)
     else: # Exact kill
-        game.tavern_deck.insert(0, defeated_enemy) # Place on top of tavern deck
+        tavern_deck_cards = _deserialize_deck(room.tavern_deck)
+        tavern_deck_cards.insert(0, defeated_enemy_card) # Place on top
+        room.tavern_deck = _serialize_deck(tavern_deck_cards)
+    room.hospital = _serialize_deck(hospital_cards)
 
-    if not game.castle_deck: # No more enemies
-        game.status = GameStatus.WON
+    room.active_joker_cancels_immunity = False # Reset joker effect
+
+    castle_deck_cards = _deserialize_deck(room.castle_deck)
+    if not castle_deck_cards:
+        room.status = GameStatusEnum.WON
+        room.current_enemy_str = None # No more enemies
         return
 
     # Set up next enemy
-    game.current_enemy = game.castle_deck.pop(0)
-    game.current_enemy_health = ROYAL_HEALTH[game.current_enemy.rank]
-    game.current_enemy_base_attack = ROYAL_ATTACK[game.current_enemy.rank]
-    game.current_enemy_shield = 0
-    # Current player takes another turn, Royal does not attack this interim
+    next_enemy_card = castle_deck_cards.pop(0)
+    room.castle_deck = _serialize_deck(castle_deck_cards)
+    room.current_enemy_str = next_enemy_card.to_str()
+    room.current_enemy_health = ROYAL_HEALTH_CONST[next_enemy_card.rank]
+    room.current_enemy_base_attack = ROYAL_ATTACK_CONST[next_enemy_card.rank]
+    room.current_enemy_shield = 0
+    # Current player takes another turn, Royal does not attack this interim. Turn does not advance yet.
 
-def play_cards(room_code: str, player_id: str, card_strs_played: List[str]) -> Tuple[bool, Optional[str]]:
-    """
-    Player plays one or more cards.
-    card_strs_played: List of strings like ["H5", "C5"] or ["SA"] or ["X"]
-    """
-    game = games.get(room_code)
-    if not game: return False, "Room not found."
-    if _check_game_over(game): return False, f"Game is over: {game.status.name}"
-    if game.status != GameStatus.IN_PROGRESS: return False, "Game not started."
-
-    player = game.get_player(player_id)
-    current_player = game.get_current_player()
-    if not player or player != current_player:
-        return False, "Not your turn or player not found."
-    if not game.current_enemy:
-        return False, "No active enemy." # Should not happen in IN_PROGRESS
-
-    played_cards: List[Card] = []
+def play_cards(room_code: str, player_id: str, card_strs_played_from_req: List[str]) -> Tuple[bool, Optional[str]]:
+    db_gen = get_db()
+    db = next(db_gen)
     try:
-        for cs in card_strs_played:
-            card = _get_card_from_str(cs)
-            # Check if player has the card
+        room = _get_game_room(db, room_code)
+        if not room or room.status not in [GameStatusEnum.IN_PROGRESS]:
+            return False, "Game not found or not in progress."
+
+        player = _get_player(db, player_id, room_code)
+        current_player_obj = _get_current_player_obj(room, db)
+        if not player or player != current_player_obj:
+            return False, "Not your turn or player not found in this room."
+        if not room.current_enemy_str:
+            return False, "No active enemy."
+
+        current_enemy_card = Card.from_str(room.current_enemy_str)
+        player_hand_cards = _deserialize_deck(player.hand)
+        
+        played_cards_obj: List[Card] = []
+        temp_hand_for_validation = player_hand_cards[:] # Copy for validation
+
+        for card_str_req in card_strs_played_from_req:
+            card_to_play = Card.from_str(card_str_req)
             found_in_hand = False
-            for hand_card_idx, hand_card in enumerate(player.hand):
-                if hand_card.rank == card.rank and hand_card.suit == card.suit:
-                    played_cards.append(player.hand.pop(hand_card_idx))
+            for i, hand_card in enumerate(temp_hand_for_validation):
+                if hand_card.suit == card_to_play.suit and hand_card.rank == card_to_play.rank:
+                    played_cards_obj.append(temp_hand_for_validation.pop(i))
                     found_in_hand = True
                     break
             if not found_in_hand:
-                # Rollback cards removed from hand if one is missing
-                for p_card in played_cards: player.hand.append(p_card)
-                return False, f"Card {cs} not in hand."
-    except ValueError as e:
-        return False, str(e)
+                return False, f"Card {card_str_req} not found in hand or already selected."
+        
+        if not played_cards_obj: return False, "No cards were played."
 
-    if not played_cards:
-        return False, "No cards selected to play."
+        # --- Validate Play (same logic as before, using Card objects) ---
+        is_joker_play = any(c.rank == JOKER_RANK for c in played_cards_obj)
+        total_attack_value = 0
 
-    # --- Validate Play ---
-    is_joker_play = any(c.rank == JOKER_RANK for c in played_cards)
-    is_animal_companion = False
-    is_set_play = False
-    total_attack_value = 0
+        if is_joker_play:
+            if len(played_cards_obj) > 1: return False, "Joker must be played alone."
+            joker_card = played_cards_obj[0]
+            room.active_joker_cancels_immunity = True
+            
+            hospital_list = _deserialize_deck(room.hospital)
+            hospital_list.append(joker_card)
+            room.hospital = _serialize_deck(hospital_list)
+            
+            player.hand = _serialize_deck(temp_hand_for_validation) # Update player's hand
+            # Joker play: Royal does not attack, turn advances.
+            _advance_turn(room)
+            room.consecutive_yields = 0
+            db.commit()
+            return True, f"Joker played by {player.player_name}. Immunity cancelled for {current_enemy_card}. Royal does not attack. Next player's turn."
 
-    if is_joker_play:
-        if len(played_cards) > 1:
-            for p_card in played_cards: player.hand.append(p_card) # Return cards to hand
-            return False, "Joker must be played alone."
-        joker = played_cards[0]
-        game.active_joker_cancels_immunity = True
-        game.hospital.append(joker) # Joker goes to hospital
-        # Player who played Joker chooses next player (simplification: next player in order)
-        # Or you could add another param: next_player_id
-        # For now, turn advances, Royal does NOT attack.
-        _advance_turn(game)
-        game.consecutive_yields = 0
-        return True, "Joker played. Immunity cancelled for this enemy. Royal does not attack."
+        # Not a Joker play
+        if len(played_cards_obj) == 1:
+            total_attack_value = played_cards_obj[0].get_attack_power()
+        elif len(played_cards_obj) == 2 and any(c.rank == "A" for c in played_cards_obj): # Animal Companion
+            ace = next(c for c in played_cards_obj if c.rank == "A")
+            other_card = next(c for c in played_cards_obj if c.rank != "A")
+            if other_card.rank == JOKER_RANK: return False, "Ace cannot be companioned with a Joker."
+            total_attack_value = other_card.get_attack_power() + ace.get_attack_power()
+        else: # Set play
+            first_rank = played_cards_obj[0].rank
+            if not all(c.rank == first_rank for c in played_cards_obj): return False, "Set play cards must be of the same rank."
+            if not first_rank.isdigit() or not (2 <= int(first_rank) <= 5): return False, "Set play only allowed for ranks 2, 3, 4, or 5."
+            total_attack_value = sum(c.get_attack_power() for c in played_cards_obj)
+            if total_attack_value > 10: return False, "Set play attack sum cannot exceed 10."
 
-    # Not a Joker play
-    if len(played_cards) == 1:
-        total_attack_value = played_cards[0].get_attack_power()
-    elif len(played_cards) == 2 and any(c.rank == "A" for c in played_cards): # Animal Companion
-        ace = next(c for c in played_cards if c.rank == "A")
-        other_card = next(c for c in played_cards if c.rank != "A")
-        if other_card.rank == JOKER_RANK: # Ace cannot be played with Joker as companion
-            for p_card in played_cards: player.hand.append(p_card)
-            return False, "Ace cannot be companioned with a Joker."
-        total_attack_value = other_card.get_attack_power() + ace.get_attack_power() # Ace adds 1 effectively
-        is_animal_companion = True
-    else: # Set play
-        is_set_play = True
-        first_rank = played_cards[0].rank
-        if not all(c.rank == first_rank for c in played_cards):
-            for p_card in played_cards: player.hand.append(p_card)
-            return False, "Set play cards must be of the same rank."
-        if not first_rank.isdigit() or not (2 <= int(first_rank) <= 5):
-            for p_card in played_cards: player.hand.append(p_card)
-            return False, "Set play only allowed for ranks 2, 3, 4, 5."
-        total_attack_value = sum(c.get_attack_power() for c in played_cards)
-        if total_attack_value > 10:
-            for p_card in played_cards: player.hand.append(p_card)
-            return False, "Set play attack sum cannot exceed 10."
+        player.hand = _serialize_deck(temp_hand_for_validation) # Commit hand changes
+        room.consecutive_yields = 0
 
-    game.consecutive_yields = 0 # Reset yields on valid play
+        # --- Activate Suit Powers ---
+        actual_damage_to_deal = total_attack_value
+        enemy_is_immune_to_suit = lambda suit: (suit == current_enemy_card.suit and not room.active_joker_cancels_immunity)
 
-    # --- Activate Suit Powers ---
-    actual_damage = total_attack_value
-    enemy_immune_suit = game.current_enemy.suit
-    can_activate_power = lambda suit: not (suit == enemy_immune_suit and not game.active_joker_cancels_immunity)
+        tavern_deck_cards = _deserialize_deck(room.tavern_deck)
+        hospital_cards = _deserialize_deck(room.hospital)
 
-    for card in played_cards:
-        if card.suit == "H" and can_activate_power("H"): # Hearts (Heal)
-            # Shuffle hospital, draw X, put on bottom of tavern
-            random.shuffle(game.hospital)
-            num_to_heal = min(total_attack_value, len(game.hospital))
-            healed_cards = [game.hospital.pop(0) for _ in range(num_to_heal)]
-            game.tavern_deck.extend(healed_cards) # Add to bottom
+        for card_obj in played_cards_obj:
+            if card_obj.suit == "H" and not enemy_is_immune_to_suit("H"):
+                random.shuffle(hospital_cards)
+                num_to_heal = min(total_attack_value, len(hospital_cards))
+                healed_from_hospital = [hospital_cards.pop(0) for _ in range(num_to_heal)]
+                tavern_deck_cards.extend(healed_from_hospital)
+            elif card_obj.suit == "D" and not enemy_is_immune_to_suit("D"):
+                drawn_this_turn = 0
+                for i in range(len(room.player_order)):
+                    if drawn_this_turn >= total_attack_value: break
+                    p_idx_to_draw = (room.current_player_idx + i) % len(room.player_order)
+                    player_to_draw_id = room.player_order[p_idx_to_draw]
+                    player_to_draw_obj = _get_player(db, player_to_draw_id, room.room_code)
+                    if player_to_draw_obj:
+                        p_hand = _deserialize_deck(player_to_draw_obj.hand)
+                        max_h_size = HAND_SIZES_CONST[len(room.players)]
+                        while len(p_hand) < max_h_size and tavern_deck_cards and drawn_this_turn < total_attack_value:
+                            p_hand.append(tavern_deck_cards.pop(0))
+                            drawn_this_turn += 1
+                        player_to_draw_obj.hand = _serialize_deck(p_hand)
+            elif card_obj.suit == "S" and not enemy_is_immune_to_suit("S"):
+                room.current_enemy_shield += total_attack_value
+            elif card_obj.suit == "C" and not enemy_is_immune_to_suit("C"):
+                actual_damage_to_deal *= 2 # Applied once
 
-        elif card.suit == "D" and can_activate_power("D"): # Diamonds (Draw)
-            drawn_count = 0
-            # Start with current player, then clockwise
-            # Need to iterate through players in order from current
-            start_idx = game.current_player_idx
-            for i in range(len(game.players)):
-                if drawn_count >= total_attack_value: break
-                p_idx = (start_idx + i) % len(game.players)
-                p_to_draw = game.players[game.player_order[p_idx]]
-                max_h = HAND_SIZES[len(game.players)]
-                while len(p_to_draw.hand) < max_h and game.tavern_deck and drawn_count < total_attack_value:
-                    p_to_draw.hand.append(game.tavern_deck.pop())
-                    drawn_count += 1
-
-        elif card.suit == "S" and can_activate_power("S"): # Spades (Shield)
-            game.current_enemy_shield += total_attack_value # Cumulative
-
-        elif card.suit == "C" and can_activate_power("C"): # Clubs (Double Damage)
-            actual_damage *= 2 # Only applies once even if multiple clubs
-
-    # --- Deal Damage to Royal ---
-    game.current_enemy_health -= actual_damage
-    # Played cards go to hospital
-    for pc in played_cards: game.hospital.append(pc)
+        room.tavern_deck = _serialize_deck(tavern_deck_cards) # Update from Diamond/Heart effects
+        
+        # Played cards go to hospital (after powers resolve)
+        hospital_cards.extend(played_cards_obj)
+        room.hospital = _serialize_deck(hospital_cards)
 
 
-    # --- Check if Royal is Defeated ---
-    if game.current_enemy_health <= 0:
-        overkill = game.current_enemy_health < 0
-        _handle_enemy_defeat(game, overkill)
-        if game.status == GameStatus.WON:
-            return True, "Last King defeated! Players win!"
-        # Current player continues turn against new enemy (Royal does not attack)
-        return True, f"Enemy defeated! New enemy: {game.current_enemy}. Your turn again."
-    else:
-        # --- Royal Attacks ---
-        royal_attack_power = max(0, game.current_enemy_base_attack - game.current_enemy_shield)
-        player_defense_value = 0
-        cards_to_discard_indices = [] # Store indices to remove later
-
-        # Player must discard cards >= royal_attack_power
-        # For this API, the frontend would send which cards to discard.
-        # Here, we'll assume an auto-discard for simplicity or expect another call.
-        # For a real API, you'd need a separate `discard_for_damage(room_code, player_id, card_strs_to_discard)`
-        # This is a simplification:
-        temp_hand_for_discard = sorted(player.hand, key=lambda c: c.get_value(), reverse=True)
-        discarded_for_damage: List[Card] = []
-
-        for card_in_hand in temp_hand_for_discard:
-            if player_defense_value >= royal_attack_power:
-                break
-            player_defense_value += card_in_hand.get_value()
-            discarded_for_damage.append(card_in_hand)
-
-        if player_defense_value < royal_attack_power:
-            game.status = GameStatus.LOST
-            # Put cards back if logic failed (though here it's a loss anyway)
-            return False, f"Player {player.name} cannot withstand attack ({player_defense_value}/{royal_attack_power}). Game Over."
+        # --- Deal Damage to Royal ---
+        room.current_enemy_health -= actual_damage_to_deal
+        
+        if room.current_enemy_health <= 0:
+            overkill = room.current_enemy_health < 0
+            defeated_enemy_card_obj = Card.from_str(room.current_enemy_str) # Get it before it's cleared
+            _handle_enemy_defeat(room, overkill, defeated_enemy_card_obj, db)
+            db.commit()
+            if room.status == GameStatusEnum.WON:
+                return True, f"{player.player_name} defeated the final King! Players win!"
+            return True, f"{player.player_name} dealt {actual_damage_to_deal} damage. Enemy {defeated_enemy_card_obj} defeated! New enemy: {room.current_enemy_str}. {player.player_name}'s turn again."
         else:
-            # Successfully discarded: remove from actual hand and add to hospital
-            for d_card in discarded_for_damage:
-                for i, h_card in enumerate(player.hand):
-                    if d_card.suit == h_card.suit and d_card.rank == h_card.rank: # Find and remove one instance
-                        game.hospital.append(player.hand.pop(i))
+            # --- Royal Attacks ---
+            royal_attack_power = max(0, room.current_enemy_base_attack - room.current_enemy_shield)
+            player_hand_val_for_dmg = _deserialize_deck(player.hand) # Re-fetch current hand
+            
+            # This part still requires player to choose cards for damage.
+            # For this engine, we'll assume the frontend will make another call if needed,
+            # or the engine auto-discards. For now, let's auto-discard.
+            player_hand_val_for_dmg.sort(key=lambda c: c.get_value(), reverse=True)
+            defense_value = 0
+            cards_discarded_for_damage: List[Card] = []
+            
+            final_hand_after_damage = player_hand_val_for_dmg[:] # Copy
+            for card_in_hand in player_hand_val_for_dmg:
+                if defense_value >= royal_attack_power: break
+                defense_value += card_in_hand.get_value()
+                cards_discarded_for_damage.append(card_in_hand)
+                # Find and remove one instance from final_hand_after_damage
+                for i_fh, fh_card in enumerate(final_hand_after_damage):
+                    if fh_card.to_str() == card_in_hand.to_str():
+                        final_hand_after_damage.pop(i_fh)
                         break
-            _advance_turn(game)
-            return True, f"Damage dealt. Enemy has {game.current_enemy_health} HP. Royal attacked for {royal_attack_power}. Next player's turn."
+            
+            if defense_value < royal_attack_power:
+                room.status = GameStatusEnum.LOST
+                db.commit()
+                return False, f"Player {player.player_name} cannot withstand {current_enemy_card}'s attack of {royal_attack_power} (has {defense_value}). Game Over."
+            
+            player.hand = _serialize_deck(final_hand_after_damage)
+            hospital_list_after_attack = _deserialize_deck(room.hospital)
+            hospital_list_after_attack.extend(cards_discarded_for_damage)
+            room.hospital = _serialize_deck(hospital_list_after_attack)
+            
+            _advance_turn(room)
+            db.commit()
+            return True, f"{player.player_name} dealt {actual_damage_to_deal} damage. {current_enemy_card} has {room.current_enemy_health} HP. Royal attacked for {royal_attack_power}. {player.player_name} discarded {len(cards_discarded_for_damage)} cards. Next player's turn."
+
+    except ValueError as ve: # Catch card parsing errors etc.
+        db.rollback()
+        return False, f"Invalid card input or game data: {str(ve)}"
+    except Exception as e:
+        db.rollback()
+        # Log the full error for debugging: print(f"Error in play_cards: {e}", file=sys.stderr)
+        return False, f"An error occurred: {str(e)}"
+    finally:
+        next(db_gen, None)
+
 
 def yield_turn(room_code: str, player_id: str) -> Tuple[bool, Optional[str]]:
-    game = games.get(room_code)
-    if not game: return False, "Room not found."
-    if _check_game_over(game): return False, f"Game is over: {game.status.name}"
-    if game.status != GameStatus.IN_PROGRESS: return False, "Game not started."
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        room = _get_game_room(db, room_code)
+        if not room or room.status != GameStatusEnum.IN_PROGRESS:
+            return False, "Game not found or not in progress."
 
-    player = game.get_player(player_id)
-    current_player = game.get_current_player()
-    if not player or player != current_player:
-        return False, "Not your turn or player not found."
-    if not game.current_enemy:
-        return False, "No active enemy."
+        player = _get_player(db, player_id, room_code)
+        current_player_obj = _get_current_player_obj(room, db)
+        if not player or player != current_player_obj:
+            return False, "Not your turn or player not found."
+        if not room.current_enemy_str:
+            return False, "No active enemy."
 
-    game.consecutive_yields += 1
-    if game.consecutive_yields >= len(game.players):
-        game.status = GameStatus.LOST
-        return False, "All players yielded consecutively. Game Over."
+        current_enemy_card = Card.from_str(room.current_enemy_str)
+        room.consecutive_yields += 1
+        if room.consecutive_yields >= len(room.player_order):
+            room.status = GameStatusEnum.LOST
+            db.commit()
+            return False, "All players yielded consecutively. Game Over."
 
-    # Royal Attacks (same logic as after playing cards)
-    royal_attack_power = max(0, game.current_enemy_base_attack - game.current_enemy_shield)
-    player_defense_value = 0
-    # Simplification: auto-discard highest value cards
-    temp_hand_for_discard = sorted(player.hand, key=lambda c: c.get_value(), reverse=True)
-    discarded_for_damage: List[Card] = []
+        # --- Royal Attacks (same logic as play_cards) ---
+        royal_attack_power = max(0, room.current_enemy_base_attack - room.current_enemy_shield)
+        player_hand_cards = _deserialize_deck(player.hand)
+        player_hand_cards.sort(key=lambda c: c.get_value(), reverse=True)
+        defense_value = 0
+        cards_discarded_for_damage: List[Card] = []
+        final_hand_after_damage = player_hand_cards[:]
 
-    for card_in_hand in temp_hand_for_discard:
-        if player_defense_value >= royal_attack_power:
-            break
-        player_defense_value += card_in_hand.get_value()
-        discarded_for_damage.append(card_in_hand)
-
-    if player_defense_value < royal_attack_power:
-        game.status = GameStatus.LOST
-        return False, f"Player {player.name} cannot withstand attack ({player_defense_value}/{royal_attack_power}) after yielding. Game Over."
-    else:
-        for d_card in discarded_for_damage:
-            for i, h_card in enumerate(player.hand):
-                if d_card.suit == h_card.suit and d_card.rank == h_card.rank:
-                    game.hospital.append(player.hand.pop(i))
+        for card_in_hand in player_hand_cards:
+            if defense_value >= royal_attack_power: break
+            defense_value += card_in_hand.get_value()
+            cards_discarded_for_damage.append(card_in_hand)
+            for i_fh, fh_card in enumerate(final_hand_after_damage):
+                if fh_card.to_str() == card_in_hand.to_str():
+                    final_hand_after_damage.pop(i_fh)
                     break
-        _advance_turn(game)
-        return True, f"Yielded. Royal attacked for {royal_attack_power}. Next player's turn."
+        
+        if defense_value < royal_attack_power:
+            room.status = GameStatusEnum.LOST
+            db.commit()
+            return False, f"Player {player.player_name} yielded and cannot withstand {current_enemy_card}'s attack of {royal_attack_power} (has {defense_value}). Game Over."
+        
+        player.hand = _serialize_deck(final_hand_after_damage)
+        hospital_list_yield = _deserialize_deck(room.hospital)
+        hospital_list_yield.extend(cards_discarded_for_damage)
+        room.hospital = _serialize_deck(hospital_list_yield)
+        
+        _advance_turn(room)
+        db.commit()
+        return True, f"{player.player_name} yielded. Royal attacked for {royal_attack_power}. {player.player_name} discarded {len(cards_discarded_for_damage)} cards. Next player's turn."
+    except Exception as e:
+        db.rollback()
+        return False, f"Error during yield: {str(e)}"
+    finally:
+        next(db_gen, None)
 
 def use_solo_joker_power(room_code: str, player_id: str) -> Tuple[bool, Optional[str]]:
-    game = games.get(room_code)
-    if not game: return False, "Room not found."
-    if _check_game_over(game): return False, f"Game is over: {game.status.name}"
-    if game.status != GameStatus.IN_PROGRESS: return False, "Game not started."
-    if len(game.players) != 1: return False, "Solo Joker power only for solo games."
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        room = _get_game_room(db, room_code)
+        if not room or room.status != GameStatusEnum.IN_PROGRESS:
+            return False, "Game not found or not in progress."
+        if len(room.players) != 1: return False, "Solo Joker power only for solo games."
 
-    player = game.get_player(player_id)
-    current_player = game.get_current_player()
-    if not player or player != current_player: return False, "Not your turn or player not found."
+        player = _get_player(db, player_id, room_code)
+        current_player_obj = _get_current_player_obj(room, db)
+        if not player or player != current_player_obj: return False, "Not your turn or player not found."
 
-    if game.solo_jokers_available <= 0:
-        return False, "No solo Jokers available."
+        if room.solo_jokers_available <= 0: return False, "No solo Jokers available."
 
-    game.solo_jokers_available -= 1
-    # Discard hand
-    game.hospital.extend(player.hand)
-    player.hand = []
-    # Draw back up to 8
-    max_hand = HAND_SIZES[1]
-    while len(player.hand) < max_hand and game.tavern_deck:
-        player.hand.append(game.tavern_deck.pop())
+        room.solo_jokers_available -= 1
+        
+        player_hand_cards = _deserialize_deck(player.hand)
+        hospital_cards = _deserialize_deck(room.hospital)
+        hospital_cards.extend(player_hand_cards) # Discard entire hand to hospital
+        room.hospital = _serialize_deck(hospital_cards)
+        player.hand = [] # Clear hand
 
-    return True, f"Solo Joker used. Hand refreshed. {game.solo_jokers_available} solo Jokers remaining."
+        # Draw back up to max hand size for solo
+        new_hand_solo: List[Card] = []
+        tavern_deck_cards = _deserialize_deck(room.tavern_deck)
+        max_solo_hand = HAND_SIZES_CONST[1]
+        while len(new_hand_solo) < max_solo_hand and tavern_deck_cards:
+            new_hand_solo.append(tavern_deck_cards.pop(0))
+        
+        player.hand = _serialize_deck(new_hand_solo)
+        room.tavern_deck = _serialize_deck(tavern_deck_cards)
+        
+        db.commit()
+        return True, f"{player.player_name} used a Solo Joker. Hand refreshed. {room.solo_jokers_available} solo Jokers remaining."
+    except Exception as e:
+        db.rollback()
+        return False, f"Error using solo joker: {str(e)}"
+    finally:
+        next(db_gen, None)
 
-# --- Example Usage (Conceptual - This would be called by your interface) ---
-if __name__ == '__main__':
-    # --- Room Creation and Joining ---
-    p1_id, p1_name = "player1", "Alice"
-    p2_id, p2_name = "player2", "Bob"
+# Example of how to run initialize_database() (e.g., in a manage.py or one-off script)
+if __name__ == "__main__":
+    # This check prevents accidental execution if imported.
+    # You would typically call initialize_database() from a separate management script
+    # or carefully during application startup in a controlled way.
+    # For example:
+    # if input("Initialize database? (THIS WILL CREATE TABLES) (yes/no): ").lower() == 'yes':
+    #     initialize_database()
 
-    room_code, error = create_room(p1_id, p1_name)
-    if error:
-        print(f"Error creating room: {error}")
-        exit()
-    print(f"Room '{room_code}' created by {p1_name}.")
+    # Basic test after DB init (requires DATABASE_URL to be set up)
+    # This is just for rudimentary local testing of the engine, not for production.
+    # print("Running basic engine tests...")
+    # initialize_database() # Ensure tables exist for this test sequence
+    #
+    # p_id1 = "test_player_001"
+    # p_name1 = "Alice"
+    # p_id2 = "test_player_002"
+    # p_name2 = "Bob"
+    #
+    # rc, err = create_room(p_id1, p_name1)
+    # if err: print(f"Create room error: {err}")
+    # else: print(f"Room created: {rc}")
+    #
+    # if rc:
+    #     s, err = join_room(rc, p_id2, p_name2)
+    #     if err: print(f"Join room error: {err}")
+    #     else: print(f"Bob joined: {s}")
+    #
+    #     gs, err = get_game_state(rc, p_id1)
+    #     if err: print(f"Get state error: {err}")
+    #     else: print(f"Initial Game State for Alice: {gs}")
+    #
+    #     s, err = start_game(rc, p_id1)
+    #     if err: print(f"Start game error: {err}")
+    #     else: print(f"Game started: {s}")
+    #
+    #     gs_after_start, err = get_game_state(rc, p_id1)
+    #     if err: print(f"Get state after start error: {err}")
+    #     else:
+    #         print(f"Game State for Alice after start: {gs_after_start}")
+    #         current_player_id_test = gs_after_start.get("current_player_id")
+    #         current_player_hand_test = []
+    #         for p_info in gs_after_start.get("players", []):
+    #             if p_info["id"] == current_player_id_test:
+    #                 current_player_hand_test = p_info.get("hand", [])
+    #                 break
+    #         print(f"Current player {current_player_id_test} hand: {current_player_hand_test}")
+    #
+    #         # Example: Play first card from current player's hand
+    #         if current_player_id_test and current_player_hand_test:
+    #             card_to_play_str = current_player_hand_test[0]
+    #             print(f"Attempting to play: {card_to_play_str} by {current_player_id_test}")
+    #             s_play, msg_play = play_cards(rc, current_player_id_test, [card_to_play_str])
+    #             print(f"Play card result: {s_play}, Message: {msg_play}")
+    #
+    #             gs_after_play, _ = get_game_state(rc, p_id1)
+    #             print(f"Game State after play: {gs_after_play}")
 
-    success, error = join_room(room_code, p2_id, p2_name)
-    if error:
-        print(f"Error {p2_name} joining room: {error}")
-        exit()
-    print(f"{p2_name} joined room '{room_code}'.")
-
-    state, error = get_game_state(room_code, p1_id)
-    # print("Initial State:", state)
-
-    # --- Start Game ---
-    success, error = start_game(room_code, p1_id) # Only creator can start
-    if error:
-        print(f"Error starting game: {error}")
-        exit()
-    print("Game started!")
-
-    state, error = get_game_state(room_code, p1_id)
-    # print("State after start for Alice:", state)
-    # current_player_id = state['current_player_id']
-    # current_enemy_str = state['current_enemy']
-    # print(f"Current player: {current_player_id}, Current Enemy: {current_enemy_str}")
-
-
-    # --- Gameplay Loop (Simplified - a real interface would drive this) ---
-    game_over = False
-    turn_count = 0
-    while not game_over and turn_count < 50: # Safety break
-        turn_count += 1
-        current_state, _ = get_game_state(room_code)
-        if not current_state: break
-        if current_state['status'] not in [GameStatus.IN_PROGRESS.name]:
-            print(f"Game ended: {current_state['status']}")
-            game_over = True
-            break
-
-        cp_id = current_state['current_player_id']
-        cp_obj = games[room_code].players[cp_id]
-        print(f"\n--- Turn {turn_count} ---")
-        print(f"Current Player: {cp_obj.name} (Hand: {[str(c) for c in cp_obj.hand]})")
-        print(f"Enemy: {current_state['current_enemy']} (HP: {current_state['current_enemy_health']}, ATK: {current_state['current_enemy_attack']})")
-        print(f"Tavern: {current_state['tavern_deck_size']}, Hospital: {current_state['hospital_size']}")
-
-        # AI: Simplistic play - play first valid card or yield if hand empty
-        if not cp_obj.hand:
-            print(f"{cp_obj.name} has no cards, yielding.")
-            success, message = yield_turn(room_code, cp_id)
-        else:
-            # Try to play the first card in hand
-            card_to_play_str = str(cp_obj.hand[0]) # This is a simplification; need to find it by value
-            print(f"{cp_obj.name} plays {card_to_play_str}")
-            success, message = play_cards(room_code, cp_id, [card_to_play_str])
-
-        print(message)
-        if not success and ("Game Over" in message or "win" in message):
-            game_over = True
-
-    final_state, _ = get_game_state(room_code)
-    print("\n--- Final Game State ---")
-    print(final_state)
+    pass # Keep the __main__ block minimal or for specific setup tasks
