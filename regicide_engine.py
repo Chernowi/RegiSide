@@ -127,9 +127,27 @@ class Player(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 def initialize_database():
-    """Creates all tables in the database."""
+    """Drops and recreates all tables in the database. WARNING: This deletes existing data."""
+    # Drop all tables defined in Base.metadata (order might matter due to foreign keys)
+    # For more complex scenarios, consider a migration tool like Alembic.
+    # Dropping in reverse order of creation or explicitly handling dependencies is safer.
+    # However, for this simple schema, dropping all should work if Player depends on GameRoom.
+    # If GameRoom depends on Player (which it doesn't seem to directly for table structure),
+    # the order would need to be reversed or handled by the DB.
+    # Base.metadata.drop_all(bind=engine) # This drops all tables known to Base.metadata
+    
+    # A more robust way to handle potential foreign key constraints during drop:
+    # Get tables in an order that respects dependencies for dropping.
+    # This is a simplified approach; Alembic is better for complex cases.
+    inspector = inspect(engine)
+    # Drop dependent tables first (Player) then GameRoom
+    if inspector.has_table(Player.__tablename__):
+        Player.__table__.drop(engine)
+    if inspector.has_table(GameRoom.__tablename__):
+        GameRoom.__table__.drop(engine)
+        
     Base.metadata.create_all(bind=engine)
-    print("Database tables created/ensured.")
+    print("Database tables dropped and recreated.")
 
 # --- Database Session Management ---
 def get_db():
