@@ -51,10 +51,12 @@ CORS(app, resources={r"/api/*": {"origins": allowed_origins}}, supports_credenti
 def success_response(data, message="Success", status_code=200):
     return jsonify({"status": "success", "data": data, "message": message}), status_code
 
-def error_response(message, status_code=400, error_code=None):
+def error_response(message, status_code=400, error_code=None, data=None): # Added 'data=None'
     response = {"status": "error", "message": message}
     if error_code:
         response["error_code"] = error_code
+    if data: # Include data in the response if provided
+        response["data"] = data
     return jsonify(response), status_code
 
 # --- API Routes ---
@@ -131,6 +133,8 @@ def route_start_game():
 @app.route('/api/play_cards', methods=['POST'])
 def route_play_cards():
     data = request.json
+    if not data: # Check if request.json is None
+        return error_response("Request body must be valid JSON and Content-Type header must be application/json.", 400)
     room_code = data.get('room_code')
     player_id = data.get('player_id')
     cards_played_str = data.get('cards') # Expects a list of card strings e.g., ["H5", "S2"]
@@ -150,7 +154,7 @@ def route_play_cards():
 
     if not action_successful and "Game Over" not in message and "win" not in message and "lost" not in message :
         # Action failed for a reason other than game ending
-        return error_response(message, 400, data=current_game_state) # Return current state with error
+        return error_response(message, 400, data=current_game_state) # Now correctly handled
 
     return success_response(current_game_state, message)
 
@@ -158,6 +162,8 @@ def route_play_cards():
 @app.route('/api/yield_turn', methods=['POST'])
 def route_yield_turn():
     data = request.json
+    if not data: # Check if request.json is None
+        return error_response("Request body must be valid JSON and Content-Type header must be application/json.", 400)
     room_code = data.get('room_code')
     player_id = data.get('player_id')
 
@@ -173,13 +179,16 @@ def route_yield_turn():
         return error_response(f"Action processed with message '{message}', but failed to fetch updated game state: {state_error}", 500)
 
     if not action_successful and "Game Over" not in message and "win" not in message and "lost" not in message:
-        return error_response(message, 400, data=current_game_state)
+        return error_response(message, 400, data=current_game_state) # Now correctly handled
 
     return success_response(current_game_state, message)
 
 @app.route('/api/defend', methods=['POST'])
 def route_defend():
     data = request.json
+    if not data: # Check if request.json is None
+        return error_response("Request body must be valid JSON and Content-Type header must be application/json.", 400)
+
     room_code = data.get('room_code')
     player_id = data.get('player_id')
     cards_to_discard = data.get('cards') # List of card strings
@@ -197,13 +206,15 @@ def route_defend():
 
     if not action_successful:
          # If game ended due to failed defense, message will indicate "Game Over"
-        return error_response(message, 400, data=current_game_state) 
+        return error_response(message, 400, data=current_game_state) # Now correctly handled
 
     return success_response(current_game_state, message)
 
 @app.route('/api/choose_next_player', methods=['POST'])
 def route_choose_next_player():
     data = request.json
+    if not data: # Check if request.json is None
+        return error_response("Request body must be valid JSON and Content-Type header must be application/json.", 400)
     room_code = data.get('room_code')
     jester_player_id = data.get('player_id') # The player who played the Jester
     chosen_next_player_id = data.get('chosen_player_id')
@@ -220,13 +231,15 @@ def route_choose_next_player():
         return error_response(f"Action processed with message '{message}', but failed to fetch updated game state: {state_error}", 500)
 
     if not action_successful:
-        return error_response(message, 400, data=current_game_state)
+        return error_response(message, 400, data=current_game_state) # Now correctly handled
 
     return success_response(current_game_state, message)
 
 @app.route('/api/use_solo_joker', methods=['POST'])
 def route_use_solo_joker():
     data = request.json
+    if not data: # Check if request.json is None
+        return error_response("Request body must be valid JSON and Content-Type header must be application/json.", 400)
     room_code = data.get('room_code')
     player_id = data.get('player_id')
 
@@ -240,7 +253,7 @@ def route_use_solo_joker():
         return error_response(f"Action processed with message '{message}', but failed to fetch updated game state: {state_error}", 500)
 
     if not action_successful:
-        return error_response(message, 400, data=current_game_state)
+        return error_response(message, 400, data=current_game_state) # Now correctly handled
 
     return success_response(current_game_state, message)
 
