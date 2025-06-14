@@ -546,7 +546,7 @@ def play_cards(room_code: str, player_id: str, card_strs_played_from_req: List[s
             room.player_to_defend_id = player.id
             # Turn does not advance here; it advances after successful defense or if game is lost.
             db.commit()
-            return True, f"{player.player_name} dealt {actual_damage_to_deal} damage. {current_enemy_card} has {room.current_enemy_health} HP. {player_name} must defend against {royal_attack_power} damage."
+            return True, f"{player.player_name} dealt {actual_damage_to_deal} damage. {current_enemy_card} has {room.current_enemy_health} HP. {player.player_name} must defend against {royal_attack_power} damage."
 
     except ValueError as ve: # Catch card parsing errors etc.
         db.rollback()
