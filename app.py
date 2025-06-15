@@ -71,11 +71,12 @@ def route_create_room():
     data = request.json
     player_id = data.get('player_id')
     player_name = data.get('player_name')
+    custom_room_code = data.get('custom_room_code') # New: Get custom room code
 
     if not all([player_id, player_name]):
         return error_response("player_id and player_name are required.", 400)
 
-    room_code, error = engine.create_room(player_id, player_name)
+    room_code, error = engine.create_room(player_id, player_name, custom_room_code=custom_room_code) # Pass it to the engine
     if error:
         return error_response(error, 400) # Or a more specific error code
     return success_response({"room_code": room_code, "player_id": player_id}, "Room created successfully.", 201)

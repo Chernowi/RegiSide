@@ -53,12 +53,13 @@ This document provides details for interacting with the Regicide Game API.
 
 *   **Endpoint:** `/create_room`
 *   **Method:** `POST`
-*   **Description:** Creates a new game room and automatically adds the creator as a player.
+*   **Description:** Creates a new game room and automatically adds the creator as a player. Can optionally accept a `custom_room_code`. If provided and not in use, this code will be used; otherwise, a random code is generated.
 *   **Request Body:**
     ```json
     {
       "player_id": "string (unique ID for the player)",
-      "player_name": "string (display name for the player)"
+      "player_name": "string (display name for the player)",
+      "custom_room_code": "string (optional, desired room code)"
     }
     ```
 *   **Success Response (201 Created):**
@@ -73,7 +74,7 @@ This document provides details for interacting with the Regicide Game API.
     }
     ```
 *   **Error Responses:**
-    *   `400 Bad Request`: If `player_id` or `player_name` is missing, or other internal error.
+    *   `400 Bad Request`: If `player_id` or `player_name` is missing, if `custom_room_code` is already in use, or other internal error.
 
 ---
 

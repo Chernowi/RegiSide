@@ -252,26 +252,35 @@ def _assemble_game_state_dict(room: GameRoom, perspective_player_id: Optional[st
 
 # --- Regicide Engine API Functions ---
 
-def create_room(player_id: str, player_name: str) -> Tuple[Optional[str], Optional[str]]:
+def create_room(player_id: str, player_name: str, custom_room_code: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
     db_gen = get_db()
     db = next(db_gen)
     try:
-        room_code = str(uuid.uuid4())[:6].upper()
-        while _get_game_room(db, room_code):
-            room_code = str(uuid.uuid4())[:6].upper()
+        room_code_to_use: str
+        if custom_room_code:
+            # Validate custom_room_code length or format if desired, e.g.,
+            # if not (isinstance(custom_room_code, str) and 3 <= len(custom_room_code) <= 10 and custom_room_code.isalnum()):
+            #     return None, "Custom room code is invalid (must be 3-10 alphanumeric characters)."
+            room_code_to_use = custom_room_code.upper()
+            if _get_game_room(db, room_code_to_use):
+                return None, f"Custom room code '{room_code_to_use}' is already in use."
+        else:
+            room_code_to_use = str(uuid.uuid4())[:6].upper()
+            while _get_game_room(db, room_code_to_use):
+                room_code_to_use = str(uuid.uuid4())[:6].upper()
 
-        new_room = GameRoom(room_code=room_code, created_by_player_id=player_id, status=GameStatusEnum.WAITING_FOR_PLAYERS)
+        new_room = GameRoom(room_code=room_code_to_use, created_by_player_id=player_id, status=GameStatusEnum.WAITING_FOR_PLAYERS)
         db.add(new_room)
         db.commit() # Commit room first to satisfy foreign key for player
 
         # Automatically join the creator
-        success, error = join_room(room_code, player_id, player_name) # join_room will handle its own db session
+        success, error = join_room(room_code_to_use, player_id, player_name) # join_room will handle its own db session
         if not success:
             db.delete(new_room) # Clean up room if join fails (should be rare)
             db.commit()
             return None, f"Failed to add creator to room: {error}"
 
-        return room_code, None
+        return room_code_to_use, None
     except Exception as e:
         db.rollback()
         return None, f"Database error creating room: {str(e)}"
