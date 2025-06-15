@@ -501,19 +501,52 @@ def play_cards(room_code: str, player_id: str, card_strs_played_from_req: List[s
                 healed_from_hospital = [hospital_cards.pop(0) for _ in range(num_to_heal)]
                 tavern_deck_cards.extend(healed_from_hospital)
             elif card_obj.suit == "D" and not enemy_is_immune_to_suit("D"):
-                drawn_this_turn = 0
-                for i in range(len(room.player_order)):
-                    if drawn_this_turn >= total_attack_value: break
-                    p_idx_to_draw = (room.current_player_idx + i) % len(room.player_order)
-                    player_to_draw_id = room.player_order[p_idx_to_draw]
-                    player_to_draw_obj = _get_player(db, player_to_draw_id, room.room_code)
+                num_cards_to_distribute = total_attack_value
+                # player_draw_turn_idx is the absolute index in player_order for the player who should get the *next* card.
+                # Start with the current player (the one who played the card).
+                player_draw_turn_idx = room.current_player_idx
+                
+                cards_distributed_this_power = 0
+                # Keep track of how many consecutive players were skipped (hand full). 
+                # If this equals the number of players, no one can draw.
+                consecutive_skips = 0
+
+                while cards_distributed_this_power < num_cards_to_distribute and tavern_deck_cards:
+                    if consecutive_skips >= len(room.player_order):
+                        # All players have been skipped in a full round, meaning all hands are full or players don't exist.
+                        break
+
+                    player_id_to_draw = room.player_order[player_draw_turn_idx]
+                    player_to_draw_obj = _get_player(db, player_id_to_draw, room.room_code)
+
                     if player_to_draw_obj:
                         p_hand = _deserialize_deck(player_to_draw_obj.hand)
-                        max_h_size = HAND_SIZES_CONST[len(room.players)]
-                        while len(p_hand) < max_h_size and tavern_deck_cards and drawn_this_turn < total_attack_value:
-                            p_hand.append(tavern_deck_cards.pop(0))
-                            drawn_this_turn += 1
-                        player_to_draw_obj.hand = _serialize_deck(p_hand)
+                        # Ensure len(room.players) is a valid key for HAND_SIZES_CONST
+                        max_h_size = HAND_SIZES_CONST.get(len(room.players)) 
+                        if max_h_size is None: # Fallback, though this case should be handled by game setup
+                            # This indicates an issue, perhaps log it. For now, assume a default or skip.
+                            # For safety, let's prevent drawing if max_h_size is unknown.
+                            consecutive_skips += 1
+                            player_draw_turn_idx = (player_draw_turn_idx + 1) % len(room.player_order)
+                            continue
+
+
+                        if len(p_hand) < max_h_size:
+                            card_from_tavern = tavern_deck_cards.pop(0)
+                            p_hand.append(card_from_tavern)
+                            player_to_draw_obj.hand = _serialize_deck(p_hand)
+                            cards_distributed_this_power += 1
+                            consecutive_skips = 0 # Reset skips since a card was drawn
+                        else:
+                            # This player's hand is full, increment skips
+                            consecutive_skips += 1
+                    else:
+                        # Player object not found (should not happen in a consistent state).
+                        # Treat as a skip to avoid issues.
+                        consecutive_skips += 1
+                    
+                    # Move to the next player for the next card distribution attempt
+                    player_draw_turn_idx = (player_draw_turn_idx + 1) % len(room.player_order)
             elif card_obj.suit == "S" and not enemy_is_immune_to_suit("S"):
                 room.current_enemy_shield += total_attack_value
             elif card_obj.suit == "C" and not enemy_is_immune_to_suit("C"):
