@@ -1,0 +1,87 @@
+# MAPPO Configuration for 2-Player Regicide Training
+# Uses the 2-player environment config for faster experimentation
+
+algorithm: "mappo"
+
+# Environment configuration
+env_config: "configs/env/env_2players.yaml"
+
+# MAPPO hyperparameters (optimized for 2-player setting)
+mappo:
+  total_timesteps: 10_000_000  # Reduced for faster 2-player experiments
+  num_steps: 128  # Smaller rollouts for 2-player
+  num_minibatches: 4
+  update_epochs: 4
+
+  learning_rate: 3.0e-4
+  lr_schedule: "linear"
+  anneal_lr: true
+
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  clip_eps: 0.2
+  clip_vloss: true
+  max_grad_norm: 0.5
+
+  vf_coef: 0.5
+  ent_coef: 0.01
+
+  network:
+    hidden_dims: [128, 128]  # Smaller network for 2-player
+    activation: "relu"
+    layer_norm: false
+    use_orthogonal_init: true
+
+  normalize_advantages: true
+  normalize_values: false
+
+# Logging configuration
+logging:
+  log_interval: 10
+  save_interval: 50  # Save more frequently for shorter runs
+  eval_interval: 25
+  eval_episodes: 5
+
+  use_tensorboard: true
+  tensorboard_dir: "runs"
+
+  verbose: true
+  log_level: "INFO"
+
+  experiment_name: "mappo_regicide_2p"
+  run_name: null
+  tags: ["mappo", "regicide", "2-player", "cooperative"]
+  notes: "MAPPO training on 2-player Regicide environment"
+
+# Checkpointing
+checkpoint:
+  save_dir: "checkpoints"
+  save_best: true
+  save_last: true
+  metric: "episode_return"
+  mode: "max"
+
+# Evaluation
+evaluation:
+  enabled: true
+  deterministic: true
+  num_episodes: 5
+  render: false
+
+# Reproducibility
+seed: 42
+deterministic_mode: false
+
+# Hardware
+device: "auto"
+num_threads: 4
+
+# Backend selection
+backend: "pytorch"
+
+# Advanced options
+advanced:
+  use_wandb: false
+  wandb_project: "regicide-marl"
+  wandb_entity: null

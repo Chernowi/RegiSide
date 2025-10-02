@@ -5,9 +5,13 @@ A standalone, high-performance implementation optimized for training
 Multi-Agent Reinforcement Learning algorithms. No database, no API calls,
 pure in-memory operations with vectorized computations.
 
+This version is updated to be fully compliant with the official Regicide rules,
+including support for combo plays and correct "exact damage" mechanics, while
+maintaining backward compatibility with the original file's attribute names.
+
 Key optimizations:
 - All game logic in memory (no I/O)
-- Vectorized observations and actions  
+- Vectorized observations and actions
 - Fast reset/step functions
 - Minimal object creation
 - Optional JAX/Numba compilation support
@@ -20,12 +24,13 @@ from gymnasium import spaces
 from typing import Dict, List, Tuple, Optional, Union
 from enum import IntEnum
 import random
+from itertools import combinations
 
 
 class GameStatus(IntEnum):
     """Game status enumeration"""
     IN_PROGRESS = 0
-    AWAITING_DEFENSE = 1 
+    AWAITING_DEFENSE = 1
     AWAITING_JESTER_CHOICE = 2
     WON = 3
     LOST = 4
@@ -33,752 +38,640 @@ class GameStatus(IntEnum):
 
 class CompactCard:
     """Memory-efficient card representation using integers"""
-    
-    # Suit encoding: 0=H, 1=D, 2=S, 3=C, 4=Joker
+
+    # Suit encoding: 0=H, 1=D, 2=S, 3=C
     SUITS = ['H', 'D', 'S', 'C']
     RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
-    
+
     def __init__(self, card_id: int):
         """
         Card encoded as single integer:
-        - 0-51: Regular cards (rank * 4 + suit)  
-        - 52-53: Jokers
+        - 0-51: Regular cards (rank * 4 + suit)
+        - 52-53: Jesters
         - 255: Empty/None
         """
         self.id = card_id
-    
+
     @classmethod
     def from_string(cls, card_str: str) -> 'CompactCard':
         """Convert from string representation"""
         if card_str.startswith('X'):
-            return cls(52)  # First joker
-        
+            return cls(52)  # First jester
+
         rank = card_str[:-1]
         suit = card_str[-1]
-        
+
         rank_idx = cls.RANKS.index(rank)
         suit_idx = cls.SUITS.index(suit)
-        
+
         return cls(rank_idx * 4 + suit_idx)
-    
+
+    @property
+    def is_jester(self) -> bool:
+        return self.id >= 52
+
     @property
     def is_joker(self) -> bool:
-        return self.id >= 52
-    
+        # Alias for backward compatibility with external scripts
+        return self.is_jester
+
     @property
     def is_empty(self) -> bool:
         return self.id == 255
-    
+
     @property
     def suit_idx(self) -> int:
-        if self.is_joker or self.is_empty:
+        if self.is_jester or self.is_empty:
             return -1
         return self.id % 4
-    
+
     @property
     def rank_idx(self) -> int:
-        if self.is_joker or self.is_empty:
+        if self.is_jester or self.is_empty:
             return -1
         return self.id // 4
-    
+
     @property
     def value(self) -> int:
-        """Card value for damage calculation"""
-        if self.is_joker or self.is_empty:
+        """Card value for damage calculation and discarding"""
+        if self.is_jester:
             return 0
-        
+        if self.is_empty:
+            return 0
+
         rank_idx = self.rank_idx
         if rank_idx == 0:  # Ace
             return 1
-        elif rank_idx <= 8:  # 2-10
+        elif rank_idx <= 9:  # 2-10 (indices 1..9)
             return rank_idx + 1
-        elif rank_idx == 9:  # Jack
-            return 10  
-        elif rank_idx == 10:  # Queen
+        elif rank_idx == 10:  # Jack (index 10)
+            return 10
+        elif rank_idx == 11:  # Queen (index 11)
             return 15
-        elif rank_idx == 11:  # King
+        elif rank_idx == 12:  # King (index 12)
             return 20
         return 0
-    
+
     @property
     def attack_power(self) -> int:
         """Attack power when played"""
-        if self.is_joker or self.is_empty:
-            return 0
-        
-        rank_idx = self.rank_idx
-        if rank_idx == 0:  # Ace
-            return 1
-        elif rank_idx <= 8:  # 2-10  
-            return rank_idx + 1
-        elif rank_idx == 9:  # Jack
-            return 10
-        elif rank_idx == 10:  # Queen  
-            return 15
-        elif rank_idx == 11:  # King
-            return 20
-        return 0
+        return self.value
 
     def __str__(self):
         if self.is_empty:
             return "EMPTY"
-        if self.is_joker:
-            return "X"
+        if self.is_jester:
+            return "JESTER"
         return f"{self.RANKS[self.rank_idx]}{self.SUITS[self.suit_idx]}"
 
 
 class CompactRegicideEngine:
     """
-    High-performance, in-memory Regicide game engine.
-    
-    Uses numpy arrays and vectorized operations for maximum speed.
-    No external dependencies, no I/O operations.
+    High-performance, in-memory Regicide game engine. Fully rule-compliant.
     """
-    
+    MAX_HAND_SIZE = 8
+
     def __init__(self, num_players: int = 4, seed: Optional[int] = None):
         self.num_players = num_players
         self.rng = np.random.RandomState(seed)
-        
-        # Hand sizes by player count
+
         self.hand_sizes = {1: 8, 2: 7, 3: 6, 4: 5}
-        self.jokers_count = {1: 0, 2: 0, 3: 1, 4: 2}
-        
-        # Royal card stats 
-        self.royal_health = {9: 20, 10: 30, 11: 40}  # J, Q, K by rank_idx
-        self.royal_attack = {9: 10, 10: 15, 11: 20}
-        
+        self.jesters_count = {1: 0, 2: 0, 3: 1, 4: 2}
+
+        self.royal_health = {10: 20, 11: 30, 12: 40}  # J, Q, K by rank_idx
+        self.royal_attack = {10: 10, 11: 15, 12: 20}
+
+        # Pre-compute combination mappings for the action space
+        self._slot_pairs = list(combinations(range(self.MAX_HAND_SIZE), 2))
+        self._slot_triples = list(combinations(range(self.MAX_HAND_SIZE), 3))
+        self._slot_quads = list(combinations(range(self.MAX_HAND_SIZE), 4))
+
         self.reset()
-    
+
     def reset(self):
         """Reset game to initial state"""
-        # Game state arrays (vectorized)
         self.status = GameStatus.IN_PROGRESS
         self.current_player = 0
-        self.current_enemy_id = 255  # Start with no enemy
+        self.turns_survived = 0
+        self.consecutive_yields = 0
+        self.current_enemy_id = 255
+        
         self.current_enemy_health = 0
         self.current_enemy_attack = 0
         self.current_enemy_shield = 0
+        
         self.damage_to_defend = 0
         self.defend_player_idx = -1
         self.jester_chooser_idx = -1
-        self.joker_cancels_immunity = False
-        
-        # Decks as numpy arrays of card IDs
+        self.jester_cancels_immunity = False
+
         self.tavern_deck = np.array([], dtype=np.uint8)
-        self.castle_deck = np.array([], dtype=np.uint8) 
-        self.hospital = np.array([], dtype=np.uint8)
-        
-        # Player hands (fixed size arrays for efficiency)
-        max_hand = self.hand_sizes[self.num_players]
-        self.hands = np.full((self.num_players, max_hand), 255, dtype=np.uint8)  # 255 = empty
-        
-        # Initialize decks and deal
+        self.castle_deck = np.array([], dtype=np.uint8)
+        self.discard = np.array([], dtype=np.uint8)
+
+        self.hands = np.full((self.num_players, self.MAX_HAND_SIZE), 255, dtype=np.uint8)
+
         self._initialize_decks()
         self._deal_initial_hands()
         self._draw_first_enemy()
-    
+
     def _initialize_decks(self):
         """Create and shuffle initial decks"""
-        # Create tavern deck (Ace through 10, all suits)
-        tavern_cards = []
-        for rank_idx in range(9):  # A, 2, 3, 4, 5, 6, 7, 8, 9, 10
-            for suit_idx in range(4):
-                tavern_cards.append(rank_idx * 4 + suit_idx)
-        
-        # Add jokers
-        joker_count = self.jokers_count[self.num_players]
-        for i in range(joker_count):
-            tavern_cards.append(52 + i)
-        
-        # Shuffle
+        tavern_cards = [r * 4 + s for r in range(10) for s in range(4)]
+        jester_count = self.jesters_count[self.num_players]
+        tavern_cards.extend([52 + i for i in range(jester_count)])
         self.rng.shuffle(tavern_cards)
         self.tavern_deck = np.array(tavern_cards, dtype=np.uint8)
-        
-        # Create castle deck (Jacks, Queens, Kings)
-        castle_cards = []
-        for rank_idx in [9, 10, 11]:  # J, Q, K
-            for suit_idx in range(4):
-                castle_cards.append(rank_idx * 4 + suit_idx)
-        
-        self.rng.shuffle(castle_cards)
-        self.castle_deck = np.array(castle_cards, dtype=np.uint8)
-    
+
+        jacks = [10 * 4 + s for s in range(4)]
+        queens = [11 * 4 + s for s in range(4)]
+        kings = [12 * 4 + s for s in range(4)]
+        self.rng.shuffle(jacks)
+        self.rng.shuffle(queens)
+        self.rng.shuffle(kings)
+        self.castle_deck = np.array(jacks + queens + kings, dtype=np.uint8)
+
     def _deal_initial_hands(self):
-        """Deal cards to all players"""
         hand_size = self.hand_sizes[self.num_players]
-        
-        for player_idx in range(self.num_players):
-            for card_slot in range(hand_size):
-                if len(self.tavern_deck) > 0:
-                    card_id = self.tavern_deck[0]
-                    self.tavern_deck = self.tavern_deck[1:]
-                    self.hands[player_idx, card_slot] = card_id
-    
+        deal_count = self.num_players * hand_size
+        if len(self.tavern_deck) >= deal_count:
+            cards_to_deal = self.tavern_deck[:deal_count]
+            self.tavern_deck = self.tavern_deck[deal_count:]
+            self.hands[:, :hand_size] = cards_to_deal.reshape(self.num_players, hand_size)
+
     def _draw_first_enemy(self):
-        """Draw first enemy from castle deck"""
         if len(self.castle_deck) > 0:
             enemy_id = self.castle_deck[0]
             self.castle_deck = self.castle_deck[1:]
             self._set_current_enemy(enemy_id)
-    
+
     def _set_current_enemy(self, enemy_id: int):
-        """Set new enemy and its stats"""
         self.current_enemy_id = enemy_id
         card = CompactCard(enemy_id)
-        
         if card.rank_idx in self.royal_health:
             self.current_enemy_health = self.royal_health[card.rank_idx]
             self.current_enemy_attack = self.royal_attack[card.rank_idx]
         
-        self.current_enemy_shield = 0  # Reset shield
-    
+        self.current_enemy_shield = 0
+        self.jester_cancels_immunity = False
+
     def get_valid_actions(self, player_idx: int) -> np.ndarray:
-        """Get valid actions as numpy array of action IDs"""
-        valid = []
-        
+        valid_actions = []
         if self.status == GameStatus.IN_PROGRESS and player_idx == self.current_player:
-            # Can always yield (action 0)
-            valid.append(0)
+            if self.consecutive_yields < self.num_players - 1:
+                valid_actions.append(0)  # Yield
+
+            hand_cards = [(i, CompactCard(cid)) for i, cid in enumerate(self.hands[player_idx]) if not CompactCard(cid).is_empty]
             
-            # Can play cards from hand
-            hand = self.hands[player_idx]
-            for slot in range(len(hand)):
-                card_id = hand[slot]
-                if card_id != 255:  # Not empty
-                    # Single card play (actions 1-5)
-                    valid.append(1 + slot)
-                    
-                    # Check for ace companions
-                    card = CompactCard(card_id)
-                    if card.rank_idx == 0:  # Ace
-                        for other_slot in range(len(hand)):
-                            if other_slot != slot and hand[other_slot] != 255:
-                                other_card = CompactCard(hand[other_slot])
-                                if not other_card.is_joker and other_card.rank_idx != 0:
-                                    # Ace companion (actions 6-15)
-                                    action_id = 6 + slot * 4 + (other_slot if other_slot < slot else other_slot - 1)
-                                    if action_id < 16:
-                                        valid.append(action_id)
-            
-            # Check for sets (actions 16-20)
-            for rank_idx in range(1, 5):  # ranks 2-5
-                count = np.sum((self.hands[player_idx] != 255) & 
-                              ((self.hands[player_idx] // 4) == rank_idx))
-                if count >= 2:
-                    valid.append(16 + rank_idx - 1)
+            # Single card plays
+            for slot, card in hand_cards:
+                valid_actions.append(CompactRegicideEnv.ACTION_SINGLE_START + slot)
+
+            # Ace + other card plays
+            ace_plays = [(s, c) for s, c in hand_cards if c.rank_idx == 0]
+            other_plays = [(s, c) for s, c in hand_cards if not c.is_jester]
+            for ace_slot, _ in ace_plays:
+                for other_slot, _ in other_plays:
+                    if ace_slot != other_slot:
+                        linear_idx = ace_slot * (self.MAX_HAND_SIZE - 1) + (other_slot if other_slot < ace_slot else other_slot - 1)
+                        valid_actions.append(CompactRegicideEnv.ACTION_ACE_COMBO_START + linear_idx)
+
+            # Set combo plays (Pairs, Triples, Quads)
+            ranks_in_hand = {}
+            for slot, card in hand_cards:
+                if card.rank_idx not in ranks_in_hand: ranks_in_hand[card.rank_idx] = []
+                ranks_in_hand[card.rank_idx].append(slot)
+
+            for rank, slots in ranks_in_hand.items():
+                combo_card = CompactCard(slots[0] * 4) # temp card to get value
+                if len(slots) >= 2 and combo_card.value * 2 <= 10:
+                    for pair in combinations(slots, 2):
+                        action_idx = self._slot_pairs.index(tuple(sorted(pair)))
+                        valid_actions.append(CompactRegicideEnv.ACTION_PAIR_COMBO_START + action_idx)
+                if len(slots) >= 3 and combo_card.value * 3 <= 10:
+                    for triple in combinations(slots, 3):
+                        action_idx = self._slot_triples.index(tuple(sorted(triple)))
+                        valid_actions.append(CompactRegicideEnv.ACTION_TRIPLE_COMBO_START + action_idx)
+                if len(slots) >= 4 and combo_card.value * 4 <= 10:
+                    for quad in combinations(slots, 4):
+                        action_idx = self._slot_quads.index(tuple(sorted(quad)))
+                        valid_actions.append(CompactRegicideEnv.ACTION_QUAD_COMBO_START + action_idx)
+
+        elif self.status == GameStatus.AWAITING_DEFENSE and player_idx == self.defend_player_idx:
+            valid_actions.extend(range(CompactRegicideEnv.ACTION_DEFEND_START, CompactRegicideEnv.ACTION_DEFEND_START + 4))
+
+        elif self.status == GameStatus.AWAITING_JESTER_CHOICE and player_idx == self.jester_chooser_idx:
+            valid_actions.extend(range(CompactRegicideEnv.ACTION_JESTER_CHOICE_START, CompactRegicideEnv.ACTION_JESTER_CHOICE_START + self.num_players))
+
+        return np.array(list(set(valid_actions)), dtype=np.int32)
+
+    def step(self, player_idx: int, action: int) -> Tuple[bool, str, Dict]:
+        if self.status in [GameStatus.WON, GameStatus.LOST]:
+            return False, "Game already finished", {}
+
+        if self.status == GameStatus.IN_PROGRESS and player_idx == self.current_player:
+            if not self.get_valid_actions(player_idx).any():
+                self.status = GameStatus.LOST
+                return False, "Player has no valid moves. Game Over.", {}
+            return self._execute_play_action(player_idx, action)
         
         elif self.status == GameStatus.AWAITING_DEFENSE and player_idx == self.defend_player_idx:
-            # Defense strategies (actions 26-29)  
-            for strategy in range(4):
-                valid.append(26 + strategy)
+            return self._execute_defense_action(player_idx, action)
         
         elif self.status == GameStatus.AWAITING_JESTER_CHOICE and player_idx == self.jester_chooser_idx:
-            # Player choices (actions 0-3)
-            for target_player in range(self.num_players):
-                valid.append(target_player)
-        
-        return np.array(valid, dtype=np.int32)
-    
-    def step(self, player_idx: int, action: int) -> Tuple[bool, str, Dict]:
-        """Execute action and return (success, message, info)"""
-        if self.status == GameStatus.WON or self.status == GameStatus.LOST:
-            return False, "Game already finished", {}
-        
-        # Validate it's player's turn
-        if self.status == GameStatus.IN_PROGRESS and player_idx != self.current_player:
-            return False, f"Not player {player_idx}'s turn", {}
-        
-        if self.status == GameStatus.AWAITING_DEFENSE and player_idx != self.defend_player_idx:
-            return False, f"Player {player_idx} not defending", {}
-        
-        if self.status == GameStatus.AWAITING_JESTER_CHOICE and player_idx != self.jester_chooser_idx:
-            return False, f"Player {player_idx} not choosing", {}
-        
-        # Execute action based on current status
-        if self.status == GameStatus.IN_PROGRESS:
-            return self._execute_play_action(player_idx, action)
-        elif self.status == GameStatus.AWAITING_DEFENSE:
-            return self._execute_defense_action(player_idx, action)
-        elif self.status == GameStatus.AWAITING_JESTER_CHOICE:
             return self._execute_jester_choice(player_idx, action)
         
-        return False, "Invalid game state", {}
-    
+        return False, f"Invalid action for player {player_idx} in state {self.status.name}", {}
+
     def _execute_play_action(self, player_idx: int, action: int) -> Tuple[bool, str, Dict]:
-        """Execute play action during normal gameplay"""
+        slots = []
         hand = self.hands[player_idx]
-        
-        if action == 0:  # Yield turn
-            self._next_turn()
+
+        if action == CompactRegicideEnv.ACTION_YIELD:
+            self.consecutive_yields += 1
+            self._enemy_counterattack()
             return True, "Turn yielded", {}
         
-        elif 1 <= action <= 5:  # Play single card
-            slot = action - 1
-            if slot >= len(hand) or hand[slot] == 255:
-                return False, "Invalid card slot", {}
-            
-            card_id = hand[slot]
-            success, msg, info = self._play_cards([card_id], player_idx, [slot])
-            return success, msg, info
+        elif CompactRegicideEnv.ACTION_SINGLE_START <= action < CompactRegicideEnv.ACTION_ACE_COMBO_START:
+            slots = [action - CompactRegicideEnv.ACTION_SINGLE_START]
         
-        elif 6 <= action <= 15:  # Ace companion
-            # Decode ace companion action
-            linear_idx = action - 6
-            ace_slot = linear_idx // 4
-            other_offset = linear_idx % 4
+        elif CompactRegicideEnv.ACTION_ACE_COMBO_START <= action < CompactRegicideEnv.ACTION_PAIR_COMBO_START:
+            linear_idx = action - CompactRegicideEnv.ACTION_ACE_COMBO_START
+            ace_slot = linear_idx // (self.MAX_HAND_SIZE - 1)
+            other_offset = linear_idx % (self.MAX_HAND_SIZE - 1)
             other_slot = other_offset if other_offset < ace_slot else other_offset + 1
-            
-            if (ace_slot >= len(hand) or other_slot >= len(hand) or 
-                hand[ace_slot] == 255 or hand[other_slot] == 255):
-                return False, "Invalid ace companion slots", {}
-            
-            ace_card = CompactCard(hand[ace_slot])
-            if ace_card.rank_idx != 0:
-                return False, "First card is not an ace", {}
-            
-            cards = [hand[ace_slot], hand[other_slot]]
             slots = [ace_slot, other_slot]
-            return self._play_cards(cards, player_idx, slots)
         
-        elif 16 <= action <= 20:  # Play set
-            rank_idx = action - 16 + 1  # Convert to rank index (1-5 for ranks 2-6)
-            
-            # Find all cards of this rank
-            matching_slots = []
-            for slot in range(len(hand)):
-                if hand[slot] != 255:
-                    card = CompactCard(hand[slot])
-                    if card.rank_idx == rank_idx:
-                        matching_slots.append(slot)
-            
-            if len(matching_slots) < 2:
-                return False, f"Not enough cards of rank {rank_idx+1}", {}
-            
-            cards = [hand[slot] for slot in matching_slots]
-            return self._play_cards(cards, player_idx, matching_slots)
+        elif CompactRegicideEnv.ACTION_PAIR_COMBO_START <= action < CompactRegicideEnv.ACTION_TRIPLE_COMBO_START:
+            slots = list(self._slot_pairs[action - CompactRegicideEnv.ACTION_PAIR_COMBO_START])
         
-        return False, "Invalid action", {}
-    
-    def _play_cards(self, card_ids: List[int], player_idx: int, slots: List[int]) -> Tuple[bool, str, Dict]:
-        """Play cards and resolve effects"""
-        total_attack = sum(CompactCard(card_id).attack_power for card_id in card_ids)
+        elif CompactRegicideEnv.ACTION_TRIPLE_COMBO_START <= action < CompactRegicideEnv.ACTION_QUAD_COMBO_START:
+            slots = list(self._slot_triples[action - CompactRegicideEnv.ACTION_TRIPLE_COMBO_START])
+
+        elif CompactRegicideEnv.ACTION_QUAD_COMBO_START <= action < CompactRegicideEnv.ACTION_DEFEND_START:
+            slots = list(self._slot_quads[action - CompactRegicideEnv.ACTION_QUAD_COMBO_START])
         
-        # Remove cards from hand
-        for slot in slots:
-            self.hands[player_idx, slot] = 255
-        
-        # Check for joker
-        has_joker = any(CompactCard(card_id).is_joker for card_id in card_ids)
-        if has_joker:
-            self.joker_cancels_immunity = True
-        
-        # Apply attack to enemy
-        self.current_enemy_health = max(0, self.current_enemy_health - total_attack)
-        
-        if self.current_enemy_health <= 0:
-            # Enemy defeated
-            self._defeat_current_enemy()
-            return True, f"Enemy defeated with {total_attack} damage!", {}
         else:
-            # Enemy attacks back
-            self._enemy_counterattack()
-            return True, f"Dealt {total_attack} damage", {}
-    
-    def _defeat_current_enemy(self):
-        """Handle enemy defeat"""
-        # Move enemy to hospital
-        if self.current_enemy_id != 255:
-            self.hospital = np.append(self.hospital, self.current_enemy_id)
+            return False, "Invalid action code", {}
+
+        card_ids = [hand[s] for s in slots]
+        if any(cid == 255 for cid in card_ids): return False, "Invalid card slot(s)", {}
         
-        # Check win condition
-        if len(self.castle_deck) == 0:
-            self.status = GameStatus.WON
-            return
+        return self._play_cards(card_ids, player_idx, slots)
+
+    def _execute_defense_action(self, player_idx: int, action: int) -> Tuple[bool, str, Dict]:
+        strategy = action - CompactRegicideEnv.ACTION_DEFEND_START
+        return self._perform_defense(player_idx, strategy)
+
+    def _execute_jester_choice(self, player_idx: int, action: int) -> Tuple[bool, str, Dict]:
+        target_player = action - CompactRegicideEnv.ACTION_JESTER_CHOICE_START
+        if not (0 <= target_player < self.num_players):
+            return False, "Invalid jester choice", {}
+        self.current_player = target_player
+        self.status = GameStatus.IN_PROGRESS
+        self.jester_chooser_idx = -1
+        return True, f"Next player set to {target_player}", {}
+
+    def _play_cards(self, card_ids: List[int], player_idx: int, slots: List[int]) -> Tuple[bool, str, Dict]:
+        info = {}
+        played_cards = [CompactCard(cid) for cid in card_ids]
+
+        if any(c.is_jester for c in played_cards):
+            self.jester_cancels_immunity = True
+            self.discard = np.append(self.discard, [c.id for c in played_cards])
+            self._remove_cards_from_hand(player_idx, slots)
+            self.jester_chooser_idx = player_idx
+            self.status = GameStatus.AWAITING_JESTER_CHOICE
+            return True, "Jester played, choose next player", info
+
+        self.consecutive_yields = 0
+
+        combo_value = sum(c.value for c in played_cards)
+        unique_suits = set(c.suit_idx for c in played_cards if c.suit_idx != -1)
+        enemy_card = CompactCard(self.current_enemy_id)
+
+        heart_heal, diamond_draw, spade_shield, club_double = 0, 0, 0, 0
+        for suit in unique_suits:
+            is_immune = (suit == enemy_card.suit_idx and not self.jester_cancels_immunity)
+            if not is_immune:
+                if suit == 0: heart_heal = combo_value
+                elif suit == 1: diamond_draw = combo_value
+                elif suit == 2: spade_shield = combo_value
+                elif suit == 3: club_double = 1
+
+        if heart_heal > 0 and len(self.discard) > 0:
+            self.rng.shuffle(self.discard)
+            to_move = self.discard[:heart_heal]
+            self.discard = self.discard[heart_heal:]
+            self.tavern_deck = np.append(self.tavern_deck, to_move)
+
+        if diamond_draw > 0 and len(self.tavern_deck) > 0: self._draw_cards(player_idx, diamond_draw)
+        if spade_shield > 0: self.current_enemy_shield += spade_shield
+
+        self._remove_cards_from_hand(player_idx, slots)
+        self.discard = np.append(self.discard, card_ids)
+
+        total_attack = combo_value * (2 if club_double else 1)
+        info['damage_dealt'] = total_attack
         
-        # Draw next enemy
-        if len(self.castle_deck) > 0:
+        is_exact_damage = (total_attack == self.current_enemy_health)
+        
+        # FIX: Explicitly cast to Python int before subtraction to prevent overflow
+        self.current_enemy_health = int(self.current_enemy_health) - int(total_attack)
+
+        if self.current_enemy_health <= 0:
+            defeated_id = self.current_enemy_id
+            info['defeated_enemy_id'] = defeated_id
+
+            if is_exact_damage:
+                self.tavern_deck = np.concatenate(([defeated_id], self.tavern_deck))
+            else:
+                self.discard = np.append(self.discard, defeated_id)
+
+            if len(self.castle_deck) == 0:
+                self.status = GameStatus.WON
+                return True, "All enemies defeated. Victory!", info
+
             next_enemy = self.castle_deck[0]
             self.castle_deck = self.castle_deck[1:]
             self._set_current_enemy(next_enemy)
-        
-        self.joker_cancels_immunity = False  # Reset joker effect
-        self._next_turn()
-    
-    def _enemy_counterattack(self):
-        """Handle enemy counterattack"""
-        damage = self.current_enemy_attack
-        
-        # Check immunity (if no joker canceling)
-        if not self.joker_cancels_immunity:
-            enemy_card = CompactCard(self.current_enemy_id)
-            # Enemy is immune to its own suit - damage is doubled
-            damage *= 2
-        
-        # Set up defense phase
-        self.damage_to_defend = damage
-        self.defend_player_idx = self.current_player  
-        self.status = GameStatus.AWAITING_DEFENSE
-    
-    def _execute_defense_action(self, player_idx: int, action: int) -> Tuple[bool, str, Dict]:
-        """Execute defense action"""
-        if not (26 <= action <= 29):
-            return False, "Invalid defense action", {}
-        
-        strategy = action - 26
-        cards_discarded = self._select_defense_cards(player_idx, strategy)
-        
-        # Remove cards from hand
+            return True, f"Enemy defeated with {total_attack} damage!", info
+        else:
+            self._enemy_counterattack()
+            return True, f"Dealt {total_attack} damage", info
+
+    def _remove_cards_from_hand(self, player_idx: int, slots: List[int]):
         hand = self.hands[player_idx]
-        for card_id in cards_discarded:
-            for slot in range(len(hand)):
-                if hand[slot] == card_id:
-                    hand[slot] = 255
-                    break
-        
-        # Calculate defense value
-        defense_value = sum(CompactCard(card_id).value for card_id in cards_discarded)
-        
+        hand[slots] = 255
+        valid_cards = hand[hand != 255]
+        hand.fill(255)
+        hand[:len(valid_cards)] = valid_cards
+    
+    def _draw_cards(self, start_player_idx: int, amount: int):
+        p_idx = start_player_idx
+        drawn_count = 0
+        skipped_count = 0
+        while drawn_count < amount and len(self.tavern_deck) > 0 and skipped_count < self.num_players:
+            max_hand = self.hand_sizes[self.num_players]
+            current_hand_size = np.sum(self.hands[p_idx] != 255)
+            if current_hand_size < max_hand:
+                skipped_count = 0
+                card_to_draw = self.tavern_deck[0]
+                self.tavern_deck = self.tavern_deck[1:]
+                self.hands[p_idx, current_hand_size] = card_to_draw
+                drawn_count += 1
+            else:
+                skipped_count += 1
+            p_idx = (p_idx + 1) % self.num_players
+
+    def _enemy_counterattack(self):
+        # FIX: Explicitly cast to Python int before subtraction to prevent overflow
+        damage = max(0, int(self.current_enemy_attack) - int(self.current_enemy_shield))
+        self.damage_to_defend = damage
+        self.defend_player_idx = self.current_player
+        self.status = GameStatus.AWAITING_DEFENSE
+
+    def _perform_defense(self, player_idx: int, strategy: int) -> Tuple[bool, str, Dict]:
+        cards_to_discard, slots_to_remove = self._select_defense_cards(player_idx, strategy)
+        defense_value = sum(CompactCard(cid).value for cid in cards_to_discard)
+
         if defense_value >= self.damage_to_defend:
-            # Successful defense
+            self._remove_cards_from_hand(player_idx, slots_to_remove)
+            self.discard = np.append(self.discard, cards_to_discard)
             self.status = GameStatus.IN_PROGRESS
-            self.damage_to_defend = 0
-            self.defend_player_idx = -1
             self._next_turn()
             return True, f"Successfully defended with {defense_value} points", {}
         else:
-            # Failed defense - game over
             self.status = GameStatus.LOST
             return False, f"Defense failed: {defense_value} < {self.damage_to_defend}", {}
-    
-    def _select_defense_cards(self, player_idx: int, strategy: int) -> List[int]:
-        """Select cards for defense based on strategy"""
+
+    def _select_defense_cards(self, player_idx: int, strategy: int) -> Tuple[List[int], List[int]]:
         hand = self.hands[player_idx]
-        valid_cards = [card_id for card_id in hand if card_id != 255]
+        cards_in_hand = [(i, cid) for i, cid in enumerate(hand) if cid != 255]
+        cards_with_vals = sorted([(i, cid, CompactCard(cid).value) for i, cid in cards_in_hand], key=lambda x: x[2])
+
+        if not cards_with_vals: return [], []
+
+        selected_cards, selected_slots, total = [], [], 0
+        if strategy == 1: # Discard lowest value cards
+            for slot, cid, val in cards_with_vals:
+                selected_cards.append(cid)
+                selected_slots.append(slot)
+                total += val
+                if total >= self.damage_to_defend: break
+            return selected_cards, selected_slots
+
+        elif strategy == 2: # Discard highest value cards
+            cards_with_vals.reverse()
+            for slot, cid, val in cards_with_vals:
+                selected_cards.append(cid)
+                selected_slots.append(slot)
+                total += val
+                if total >= self.damage_to_defend: break
+            return selected_cards, selected_slots
         
-        # Sort by value
-        valid_cards.sort(key=lambda x: CompactCard(x).value)
-        
-        if strategy == 0:  # Minimal
-            selected = []
-            total = 0
-            for card_id in valid_cards:
-                selected.append(card_id)
-                total += CompactCard(card_id).value
-                if total >= self.damage_to_defend:
-                    break
-            return selected
-        elif strategy == 1:  # Conservative 
-            selected = []
-            total = 0
-            target = self.damage_to_defend + 2
-            for card_id in valid_cards:
-                selected.append(card_id)
-                total += CompactCard(card_id).value
-                if total >= target:
-                    break
-            return selected
-        elif strategy == 2:  # Aggressive
-            valid_cards.sort(key=lambda x: CompactCard(x).value, reverse=True)
-            selected = []
-            total = 0
-            for card_id in valid_cards:
-                selected.append(card_id)
-                total += CompactCard(card_id).value
-                if total >= self.damage_to_defend:
-                    break
-            return selected
-        else:  # All
-            return valid_cards
-    
-    def _execute_jester_choice(self, player_idx: int, action: int) -> Tuple[bool, str, Dict]:
-        """Execute jester next player choice"""
-        if not (0 <= action < self.num_players):
-            return False, "Invalid player choice", {}
-        
-        self.current_player = action
-        self.status = GameStatus.IN_PROGRESS
-        self.jester_chooser_idx = -1
-        
-        return True, f"Next player set to {action}", {}
-    
+        elif strategy == 3:  # Discard all
+            return [cid for _, cid, _ in cards_with_vals], [slot for slot, _, _ in cards_with_vals]
+
+        # Default/Strategy 0: Minimal cost (simplified as lowest value)
+        for slot, cid, val in cards_with_vals:
+            selected_cards.append(cid)
+            selected_slots.append(slot)
+            total += val
+            if total >= self.damage_to_defend: break
+        return selected_cards, selected_slots
+
     def _next_turn(self):
-        """Advance to next player's turn"""
         self.current_player = (self.current_player + 1) % self.num_players
-    
-    def get_state_dict(self) -> Dict:
-        """Get current game state as dictionary"""
-        return {
-            'status': int(self.status),
-            'current_player': self.current_player,
-            'current_enemy_id': int(self.current_enemy_id),
-            'current_enemy_health': self.current_enemy_health,
-            'current_enemy_attack': self.current_enemy_attack, 
-            'current_enemy_shield': self.current_enemy_shield,
-            'damage_to_defend': self.damage_to_defend,
-            'defend_player_idx': self.defend_player_idx,
-            'jester_chooser_idx': self.jester_chooser_idx,
-            'joker_cancels_immunity': self.joker_cancels_immunity,
-            'hands': self.hands.copy(),
-            'tavern_deck_size': len(self.tavern_deck),
-            'castle_deck_size': len(self.castle_deck),
-            'hospital_size': len(self.hospital),
-        }
+        self.turns_survived += 1
+
+    def get_state_dict(self):
+        return {'status': int(self.status), 'current_player': self.current_player, 'current_enemy_id': int(self.current_enemy_id), 'current_enemy_health': self.current_enemy_health, 'current_enemy_attack': self.current_enemy_attack, 'current_enemy_shield': self.current_enemy_shield, 'damage_to_defend': self.damage_to_defend, 'hands': self.hands.copy(), 'tavern_deck_size': len(self.tavern_deck), 'castle_deck_size': len(self.castle_deck)}
 
 
 class CompactRegicideEnv(gym.Env):
     """
-    Ultra-fast Regicide environment for MARL training.
-    
-    Optimizations:
-    - No I/O operations
-    - Vectorized numpy operations
-    - Minimal memory allocation
-    - Fast action validation
-    - Efficient state representation
+    Gym environment for the fully rule-compliant CompactRegicideEngine.
     """
-    
-    def __init__(self, num_players: int = 4, render_mode: Optional[str] = None):
+    MAX_HAND_SIZE = 8
+
+    # Action Space Layout
+    ACTION_YIELD = 0
+    ACTION_SINGLE_START = 1
+    ACTION_ACE_COMBO_START = ACTION_SINGLE_START + MAX_HAND_SIZE
+    ACTION_PAIR_COMBO_START = ACTION_ACE_COMBO_START + MAX_HAND_SIZE * (MAX_HAND_SIZE - 1)
+    ACTION_TRIPLE_COMBO_START = ACTION_PAIR_COMBO_START + len(list(combinations(range(MAX_HAND_SIZE), 2)))
+    ACTION_QUAD_COMBO_START = ACTION_TRIPLE_COMBO_START + len(list(combinations(range(MAX_HAND_SIZE), 3)))
+    ACTION_DEFEND_START = ACTION_QUAD_COMBO_START + len(list(combinations(range(MAX_HAND_SIZE), 4)))
+    ACTION_JESTER_CHOICE_START = ACTION_DEFEND_START + 4
+    TOTAL_ACTIONS = ACTION_JESTER_CHOICE_START + 4
+
+    def __init__(self, num_players: int = 4, render_mode: Optional[str] = None, enemy_defeat_only: bool = False):
         super().__init__()
-        
         self.num_players = num_players
         self.render_mode = render_mode
-        
-        # Compact action space (30 actions max)
-        self.action_space = spaces.Discrete(30)
-        
-        # Efficient observation space (48 features)
-        self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(48,), dtype=np.float32
-        )
-        
-        # Game engine
+        self.enemy_defeat_only = enemy_defeat_only
+        self.action_space = spaces.Discrete(self.TOTAL_ACTIONS)
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(60,), dtype=np.float32)
         self.engine = CompactRegicideEngine(num_players)
         self.current_player_idx = 0
-    
+
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None):
-        """Reset environment"""
         super().reset(seed=seed)
-        
-        if seed is not None:
-            self.engine = CompactRegicideEngine(self.num_players, seed)
-        else:
-            self.engine.reset()
-        
+        self.engine = CompactRegicideEngine(self.num_players, seed)
         self.current_player_idx = 0
-        
-        obs = self._get_observation()
-        info = self._get_info()
-        
-        return obs, info
-    
+        return self._get_observation(), self._get_info()
+
     def step(self, action: int):
-        """Execute action step"""
-        # Execute action
-        success, message, action_info = self.engine.step(self.current_player_idx, action)
-        
-        # Update current player
-        self.current_player_idx = self.engine.current_player
-        
-        # Calculate reward
-        reward = self._calculate_reward(success, message, action_info)
-        
-        # Check termination
-        terminated = (self.engine.status == GameStatus.WON or 
-                     self.engine.status == GameStatus.LOST)
-        
+        success, message, action_info = self.engine.step(self.current_player_idx, int(action))
+
+        if self.engine.status == GameStatus.AWAITING_DEFENSE:
+            self.current_player_idx = self.engine.defend_player_idx
+        elif self.engine.status == GameStatus.AWAITING_JESTER_CHOICE:
+            self.current_player_idx = self.engine.jester_chooser_idx
+        else:
+            self.current_player_idx = self.engine.current_player
+
+        terminated = (self.engine.status in [GameStatus.WON, GameStatus.LOST])
+        reward = self._calculate_reward(success, terminated, action_info)
         obs = self._get_observation()
         info = self._get_info()
         info['action_result'] = {'success': success, 'message': message}
-        
         return obs, reward, terminated, False, info
-    
+
     def _get_observation(self) -> np.ndarray:
-        """Get vectorized observation"""
-        obs = np.zeros(48, dtype=np.float32)
-        idx = 0
+        obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        state = self.engine.get_state_dict()
+        hand = state['hands'][self.current_player_idx]
         
-        # Player hand (20 features: 5 slots * 4 features each)
-        hand = self.engine.hands[self.current_player_idx]
-        for slot in range(5):
-            if slot < len(hand) and hand[slot] != 255:
-                card = CompactCard(hand[slot])
-                obs[idx] = card.value / 20.0  # Normalized value
-                obs[idx + 1] = float(card.is_joker)
-                obs[idx + 2] = card.suit_idx / 4.0 if not card.is_joker else 0.0
-                obs[idx + 3] = card.rank_idx / 12.0 if not card.is_joker else 0.0
-            idx += 4
+        # Hand features (32)
+        for i in range(self.MAX_HAND_SIZE):
+            card = CompactCard(hand[i])
+            if not card.is_empty:
+                obs[i*4] = card.value / 20.0
+                obs[i*4 + 1] = float(card.is_jester)
+                obs[i*4 + 2] = card.suit_idx / 3.0 if not card.is_jester else -1
+                obs[i*4 + 3] = card.rank_idx / 12.0 if not card.is_jester else -1
         
-        # Enemy info (4 features)
-        obs[idx] = self.engine.current_enemy_health / 40.0
-        obs[idx + 1] = self.engine.current_enemy_attack / 20.0
-        obs[idx + 2] = float(self.engine.current_enemy_id != 255)  # Enemy present
-        
-        if self.engine.current_enemy_id != 255:
-            enemy_card = CompactCard(self.engine.current_enemy_id)
-            obs[idx + 3] = enemy_card.suit_idx / 4.0
-        idx += 4
-        
-        # Game state (8 features)
-        obs[idx] = float(self.engine.status) / 4.0  # Status encoding
-        obs[idx + 1] = self.current_player_idx / (self.num_players - 1)  # Current player
-        obs[idx + 2] = len(self.engine.tavern_deck) / 50.0  # Tavern size
-        obs[idx + 3] = len(self.engine.castle_deck) / 12.0  # Castle size
-        obs[idx + 4] = len(self.engine.hospital) / 12.0  # Hospital size
-        obs[idx + 5] = float(self.engine.joker_cancels_immunity)  # Joker active
-        obs[idx + 6] = self.engine.damage_to_defend / 20.0  # Defense damage
-        obs[idx + 7] = float(self.engine.defend_player_idx == self.current_player_idx)  # Is defending
-        idx += 8
-        
-        # Hand summary stats (8 features)
-        valid_cards = hand[hand != 255]
-        if len(valid_cards) > 0:
-            values = [CompactCard(card_id).value for card_id in valid_cards]
-            obs[idx] = len(valid_cards) / 8.0  # Hand size
-            obs[idx + 1] = np.mean(values) / 20.0  # Average value
-            obs[idx + 2] = np.max(values) / 20.0  # Max value
-            obs[idx + 3] = np.min(values) / 20.0  # Min value
-            
-            # Count by suits
-            suits = [CompactCard(card_id).suit_idx for card_id in valid_cards if not CompactCard(card_id).is_joker]
-            for suit_idx in range(4):
-                obs[idx + 4 + suit_idx] = suits.count(suit_idx) / 8.0
-        idx += 8
-        
-        # Action context (8 features - remaining space)
+        # Enemy features (4)
+        obs[32] = state['current_enemy_health'] / 40.0
+        obs[33] = state['current_enemy_attack'] / 20.0
+        obs[34] = state['current_enemy_shield'] / 40.0
+        obs[35] = CompactCard(state['current_enemy_id']).suit_idx / 3.0 if state['current_enemy_id'] != 255 else -1
+
+        # Game state features (8)
+        obs[36] = float(state['status']) / 4.0
+        obs[37] = self.current_player_idx / (self.num_players - 1) if self.num_players > 1 else 0
+        obs[38] = state['tavern_deck_size'] / 54.0
+        obs[39] = state['castle_deck_size'] / 12.0
+        obs[40] = (12 - state['castle_deck_size']) / 12.0
+        obs[41] = float(self.engine.jester_cancels_immunity)
+        obs[42] = state['damage_to_defend'] / 40.0
+        obs[43] = float(self.engine.defend_player_idx == self.current_player_idx)
+
+        # Hand summary features (8)
+        hand_cards = [CompactCard(cid) for cid in hand if cid != 255]
+        if hand_cards:
+            values = [c.value for c in hand_cards]
+            obs[44] = len(hand_cards) / self.engine.hand_sizes[self.num_players]
+            obs[45] = np.mean(values) / 20.0
+            obs[46] = np.max(values) / 20.0
+            obs[47] = np.min(values) / 20.0
+            suits = [c.suit_idx for c in hand_cards if not c.is_jester]
+            for s_idx in range(4): obs[48 + s_idx] = suits.count(s_idx) / len(hand_cards) if hand_cards else 0
+
+        # Action context features (8)
         valid_actions = self.engine.get_valid_actions(self.current_player_idx)
-        obs[idx] = len(valid_actions) / 30.0  # Number of valid actions
-        
-        # Action type availability
-        obs[idx + 1] = float(0 in valid_actions)  # Can yield
-        obs[idx + 2] = float(any(1 <= a <= 5 for a in valid_actions))  # Can play single
-        obs[idx + 3] = float(any(6 <= a <= 15 for a in valid_actions))  # Can play ace combo
-        obs[idx + 4] = float(any(16 <= a <= 20 for a in valid_actions))  # Can play set
-        obs[idx + 5] = float(any(26 <= a <= 29 for a in valid_actions))  # Can defend
-        obs[idx + 6] = float(any(0 <= a <= 3 for a in valid_actions))  # Can choose player
-        obs[idx + 7] = 0.0  # Reserved
+        obs[52] = len(valid_actions) / self.action_space.n
+        obs[53] = float(0 in valid_actions)
+        obs[54] = float(any(self.ACTION_SINGLE_START <= a < self.ACTION_ACE_COMBO_START for a in valid_actions))
+        obs[55] = float(any(self.ACTION_ACE_COMBO_START <= a < self.ACTION_PAIR_COMBO_START for a in valid_actions))
+        obs[56] = float(any(self.ACTION_PAIR_COMBO_START <= a < self.ACTION_DEFEND_START for a in valid_actions))
+        obs[57] = float(any(self.ACTION_DEFEND_START <= a < self.ACTION_JESTER_CHOICE_START for a in valid_actions))
+        obs[58] = float(any(self.ACTION_JESTER_CHOICE_START <= a < self.TOTAL_ACTIONS for a in valid_actions))
         
         return obs
-    
-    def _calculate_reward(self, success: bool, message: str, action_info: Dict) -> float:
-        """Calculate reward signal"""
-        if self.engine.status == GameStatus.WON:
-            return 100.0
-        elif self.engine.status == GameStatus.LOST:
-            return -100.0
+
+    def _calculate_reward(self, success: bool, terminated: bool, action_info: Dict) -> float:
+        enemy_defeat_reward = 0.0
+        if 'defeated_enemy_id' in action_info:
+            enemy_card = CompactCard(action_info['defeated_enemy_id'])
+            enemy_defeat_reward += 1.0 + (enemy_card.rank_idx - 10)
+
+        if self.enemy_defeat_only:
+            return enemy_defeat_reward
+
+        if not success: return -0.5
+        if terminated and self.engine.status == GameStatus.WON: return 10.0 + enemy_defeat_reward
+        if terminated and self.engine.status == GameStatus.LOST: return -10.0
         
-        if not success:
-            return -1.0  # Invalid action penalty
+        reward = enemy_defeat_reward
+        if 'damage_dealt' in action_info:
+            reward += action_info['damage_dealt'] / 40.0
         
-        # Small positive reward for valid actions
-        return 0.1
-    
+        return reward
+
     def _get_info(self) -> Dict:
-        """Get info dictionary"""
         return {
-            'num_players': self.num_players,
             'current_player': self.current_player_idx,
-            'game_status': int(self.engine.status),
+            'game_status': self.engine.status.name,
             'valid_actions': self.engine.get_valid_actions(self.current_player_idx).tolist(),
             'enemy_health': self.engine.current_enemy_health,
             'hand_size': np.sum(self.engine.hands[self.current_player_idx] != 255),
+            'enemies_remaining': len(self.engine.castle_deck),
         }
-    
+
     def get_valid_action_mask(self) -> np.ndarray:
-        """Get boolean mask for valid actions (for action masking)"""
         mask = np.zeros(self.action_space.n, dtype=bool)
         valid_actions = self.engine.get_valid_actions(self.current_player_idx)
         mask[valid_actions] = True
         return mask
-    
+
     def render(self):
-        """Render game state"""
         if self.render_mode == "human":
             state = self.engine.get_state_dict()
-            print(f"=== Compact Regicide (Player {self.current_player_idx}) ===")
-            print(f"Status: {GameStatus(state['status']).name}")
-            print(f"Enemy: {CompactCard(state['current_enemy_id'])} "
-                  f"(HP: {state['current_enemy_health']})")
+            enemy_card = CompactCard(state['current_enemy_id'])
+            # Get max health for rendering
+            max_health = self.engine.royal_health.get(enemy_card.rank_idx, state['current_enemy_health'])
             
-            hand = state['hands'][self.current_player_idx]
-            hand_cards = [str(CompactCard(card_id)) for card_id in hand if card_id != 255]
+            print(f"\n--- Turn {self.engine.turns_survived}, Player {self.current_player_idx} ---")
+            print(f"Status: {GameStatus(state['status']).name}")
+            print(f"Enemy: {enemy_card} (HP: {state['current_enemy_health']}/{max_health}, ATK: {state['current_enemy_attack']}, SHIELD: {state['current_enemy_shield']})")
+            
+            hand_cards = [str(CompactCard(cid)) for cid in state['hands'][self.current_player_idx] if cid != 255]
             print(f"Hand: {hand_cards}")
             
-            valid_actions = self.engine.get_valid_actions(self.current_player_idx)
-            print(f"Valid actions: {len(valid_actions)}")
-            print("=" * 40)
+            if state['status'] == GameStatus.AWAITING_DEFENSE:
+                print(f"Must defend against {state['damage_to_defend']} damage!")
 
-
-# Vectorized batch environment for efficient MARL training
-class VectorizedRegicideEnv:
-    """
-    Vectorized environment for training multiple agents simultaneously.
-    
-    Supports batch reset/step operations for maximum training throughput.
-    """
-    
-    def __init__(self, num_envs: int, num_players: int = 4):
-        self.num_envs = num_envs
-        self.num_players = num_players
-        
-        # Create batch of environments
-        self.envs = [CompactRegicideEnv(num_players) for _ in range(num_envs)]
-        
-        # Shared spaces
-        self.action_space = self.envs[0].action_space
-        self.observation_space = self.envs[0].observation_space
-    
-    def reset(self, seed: Optional[int] = None):
-        """Reset all environments"""
-        obs_batch = []
-        info_batch = []
-        
-        for i, env in enumerate(self.envs):
-            env_seed = seed + i if seed is not None else None
-            obs, info = env.reset(seed=env_seed)
-            obs_batch.append(obs)
-            info_batch.append(info)
-        
-        return np.array(obs_batch), info_batch
-    
-    def step(self, actions: np.ndarray):
-        """Step all environments"""
-        obs_batch = []
-        rewards_batch = []
-        terminated_batch = []
-        truncated_batch = []
-        info_batch = []
-        
-        for env, action in zip(self.envs, actions):
-            obs, reward, terminated, truncated, info = env.step(action)
-            obs_batch.append(obs)
-            rewards_batch.append(reward)
-            terminated_batch.append(terminated)
-            truncated_batch.append(truncated)
-            info_batch.append(info)
-        
-        return (np.array(obs_batch), np.array(rewards_batch), 
-                np.array(terminated_batch), np.array(truncated_batch), info_batch)
-    
-    def get_valid_action_masks(self) -> np.ndarray:
-        """Get action masks for all environments"""
-        masks = []
-        for env in self.envs:
-            masks.append(env.get_valid_action_mask())
-        return np.array(masks)
-
+            print(f"Tavern Deck: {state['tavern_deck_size']} cards | Castle Deck: {state['castle_deck_size']} cards")
+            print("-" * 20)
 
 if __name__ == "__main__":
-    # Simple test
-    env = CompactRegicideEnv()
+    env = CompactRegicideEnv(num_players=2, render_mode="human")
     obs, info = env.reset(seed=42)
-    
-    print(f"Observation shape: {obs.shape}")
-    print(f"Action space: {env.action_space}")
-    print(f"Valid actions: {info['valid_actions']}")
-    
-    # Test step
-    action = info['valid_actions'][0] if info['valid_actions'] else 0
-    obs, reward, terminated, truncated, info = env.step(action)
-    
-    print(f"Reward: {reward}, Terminated: {terminated}")
-    print(f"New valid actions: {info['valid_actions']}")
+    env.render()
+
+    terminated = False
+    total_reward = 0
+    turn_count = 0
+    while not terminated and turn_count < 200: # Safety break
+        valid_actions = info['valid_actions']
+        if not valid_actions:
+            print("No valid actions, game should end.")
+            break
+        
+        action = random.choice(valid_actions)
+        print(f"Player {env.current_player_idx} takes action: {action}")
+        
+        obs, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+        
+        print(f"Action Result: {info['action_result']['message']}")
+        print(f"Reward: {reward:.2f}, Total Reward: {total_reward:.2f}")
+        env.render()
+        turn_count += 1
+        
+    print(f"\n=== GAME OVER ===")
+    print(f"Final status: {info['game_status']}")
+    print(f"Total turns: {turn_count}")

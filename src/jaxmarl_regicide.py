@@ -266,7 +266,7 @@ class JaxMARLRegicide(MultiAgentEnv):
         new_state = new_state.replace(step=state.step + 1)
         
         # Check for episode termination
-        done = (new_state.status == 3) | (new_state.status == 4) | (new_state.step >= self.max_steps)
+        done = (new_state.status == 3) | (new_state.status == 4)  # Only terminate on win/loss, no step limit
         new_state = new_state.replace(terminal=done)
         
         # Calculate rewards
@@ -372,18 +372,19 @@ class JaxMARLRegicide(MultiAgentEnv):
         
         tavern_deck = jnp.array(tavern_cards, dtype=jnp.int32)
         
-        # Castle deck: J, Q, K all suits
-        castle_cards = []
-        for rank in range(9, 12):  # J, Q, K
-            for suit in range(4):
-                castle_cards.append(rank * 4 + suit)
+        # Castle deck: J, Q, K all suits (shuffle within ranks)
+        jacks = jnp.array([9 * 4 + suit for suit in range(4)], dtype=jnp.int32)
+        queens = jnp.array([10 * 4 + suit for suit in range(4)], dtype=jnp.int32)
+        kings = jnp.array([11 * 4 + suit for suit in range(4)], dtype=jnp.int32)
         
-        castle_deck = jnp.array(castle_cards, dtype=jnp.int32)
+        # Shuffle within ranks
+        key1, key2, key3, key4 = jax.random.split(key, 4)
+        jacks = jax.random.permutation(key1, jacks)
+        queens = jax.random.permutation(key2, queens)
+        kings = jax.random.permutation(key3, kings)
         
-        # Shuffle decks
-        key1, key2 = jax.random.split(key)
-        tavern_deck = jax.random.permutation(key1, tavern_deck)
-        castle_deck = jax.random.permutation(key2, castle_deck)
+        castle_deck = jnp.concatenate([jacks, queens, kings])
+        tavern_deck = jax.random.permutation(key4, tavern_deck)
         
         return tavern_deck, castle_deck
     
@@ -503,7 +504,7 @@ class JaxMARLRegicide(MultiAgentEnv):
             (state.status == 1).astype(jnp.float32),  # Awaiting defense
             (state.status == 2).astype(jnp.float32),  # Awaiting jester choice
             (player_idx == state.current_player).astype(jnp.float32),
-            state.step / self.max_steps
+            0.0  # No step limit, so this is always 0
         ]))
         
         return obs
@@ -557,10 +558,14 @@ class JaxMARLRegicide(MultiAgentEnv):
         # For now, just implement basic actions and state transitions
         new_state = state
         
-        # Action 0: Yield - advance to next player
+        # Action 0: Yield - trigger defense phase
         new_state = lax.cond(
             action == 0,
-            lambda s: s.replace(current_player=(s.current_player + 1) % self.num_players),
+            lambda s: s.replace(
+                status=1,  # AWAITING_DEFENSE
+                defend_player_idx=s.current_player,
+                damage_to_defend=s.current_enemy_attack
+            ),
             lambda s: s,
             new_state
         )

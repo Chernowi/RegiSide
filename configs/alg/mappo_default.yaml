@@ -1,0 +1,100 @@
+# MAPPO Configuration for Regicide Training
+# python train.py --config configs/alg/mappo_default.yaml
+
+# Algorithm selection
+algorithm: "mappo"
+
+# Environment configuration (references separate env config file)
+env_config: "configs/env/env_default.yaml"
+
+# MAPPO hyperparameters
+mappo:
+  # Training parameters
+  total_timesteps: 50_000_000
+  num_steps: 256  # Number of steps per rollout
+  num_minibatches: 8
+  update_epochs: 4
+  
+  # Learning rates
+  learning_rate: 3.0e-4
+  lr_schedule: "linear"  # Options: constant, linear, cosine
+  anneal_lr: true
+  
+  # Discount and advantage estimation
+  gamma: 0.99
+  gae_lambda: 0.95
+  
+  # PPO clipping
+  clip_eps: 0.2
+  clip_vloss: true
+  max_grad_norm: 0.5
+  
+  # Loss coefficients
+  vf_coef: 0.5
+  ent_coef: 0.01
+  
+  # Network architecture
+  network:
+    hidden_dims: [256, 256]
+    activation: "relu"  # Options: relu, tanh, elu
+    layer_norm: false
+    use_orthogonal_init: true
+  
+  # Value function
+  normalize_advantages: true
+  normalize_values: false
+  
+# Logging configuration
+logging:
+  log_interval: 10  # Log every N updates
+  save_interval: 50000  # Save model every N updates
+  eval_interval: 1000  # Evaluate every N updates
+  eval_episodes: 10
+  
+  # Tensorboard
+  use_tensorboard: true
+  tensorboard_dir: "runs"
+  
+  # Console logging
+  verbose: true
+  log_level: "INFO"  # Options: DEBUG, INFO, WARNING, ERROR
+  
+  # Experiment tracking
+  experiment_name: "mappo_regicide"
+  run_name: null  # Auto-generated if null
+  tags: ["mappo", "regicide", "cooperative"]
+  notes: "MAPPO training on Regicide environment"
+
+# Checkpointing
+checkpoint:
+  save_dir: "checkpoints"
+  save_best: true
+  save_last: true
+  metric: "episode_return"  # Metric to determine best model
+  mode: "max"  # Options: max, min
+  
+# Evaluation
+evaluation:
+  enabled: true
+  deterministic: true
+  num_episodes: 10
+  render: false
+  visualize_games: true  # Enable textual visualization of evaluation games
+  visualization_interval: 500  # Log game narratives every N training episodes
+
+# Reproducibility
+seed: 42
+deterministic_mode: false
+
+# Hardware
+device: "auto"  # Options: auto, cpu, cuda, gpu
+num_threads: 4
+
+# Backend selection
+backend: "pytorch"  # Options: pytorch, jax
+
+# Advanced options
+advanced:
+  use_wandb: false
+  wandb_project: "regicide-marl"
+  wandb_entity: null
