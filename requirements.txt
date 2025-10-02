@@ -3,3 +3,5 @@ gunicorn
 psycopg2-binary 
 flask-cors  
 SQLAlchemy
+gymnasium
+numpy
