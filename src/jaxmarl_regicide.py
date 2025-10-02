@@ -132,11 +132,15 @@ class JaxMARLRegicide(MultiAgentEnv):
             seed: Random seed for reproducibility
         """
         # Initialize base class
-        super().__init__(num_players=num_players)
+        if JAXMARL_AVAILABLE:
+            super().__init__(num_players=num_players)
+        else:
+            super().__init__()
         
         if not (1 <= num_players <= 4):
             raise ValueError("num_players must be between 1 and 4")
         
+        self.num_players = num_players
         self.max_steps = max_steps
         self.seed = seed
         
@@ -249,9 +253,10 @@ class JaxMARLRegicide(MultiAgentEnv):
             dones: Done flags for each agent
             infos: Additional info
         """
-        # Get current player's action
-        current_player_name = self.agents[state.current_player]
-        action = actions[current_player_name]
+        # Convert actions dict to array indexed by player ID
+        # This allows us to use JAX array indexing instead of Python dict indexing
+        actions_array = jnp.array([actions[agent] for agent in self.agents])
+        action = actions_array[state.current_player]
         
         # Execute action and get new state
         key, step_key = jax.random.split(key)
@@ -283,6 +288,11 @@ class JaxMARLRegicide(MultiAgentEnv):
         }
         
         return observations, new_state, rewards, dones, infos
+    
+    # Alias for JaxMARL compatibility
+    def step(self, key: chex.PRNGKey, state: RegicideState, actions: Dict[str, chex.Array]) -> Tuple[Dict[str, chex.Array], RegicideState, Dict[str, float], Dict[str, bool], Dict]:
+        """Alias for step_env to match standard JaxMARL API."""
+        return self.step_env(key, state, actions)
     
     @partial(jax.jit, static_argnums=(0,))
     def get_obs(self, state: RegicideState) -> Dict[str, chex.Array]:
@@ -449,20 +459,23 @@ class JaxMARLRegicide(MultiAgentEnv):
             is_empty = card_id == self.EMPTY_CARD
             is_joker = (card_id >= self.JOKER_START) & (card_id < self.EMPTY_CARD)
             
-            value = lax.cond(is_empty | is_joker, lambda: 0.0, lambda: self._get_card_value(card_id) / 20.0)
-            rank = lax.cond(is_empty | is_joker, lambda: 0.0, lambda: self._get_card_rank(card_id) / 12.0)
-            suit = lax.cond(is_empty | is_joker, lambda: 0.0, lambda: self._get_card_suit(card_id) / 4.0)
-            is_ace = lax.cond(is_empty | is_joker, lambda: 0.0, lambda: float(self._get_card_rank(card_id) == 0))
+            # Use jnp.where instead of lax.cond for better composability
+            value = jnp.where(is_empty | is_joker, 0.0, self._get_card_value(card_id) / 20.0)
+            rank = jnp.where(is_empty | is_joker, 0.0, self._get_card_rank(card_id) / 12.0)
+            suit = jnp.where(is_empty | is_joker, 0.0, self._get_card_suit(card_id) / 4.0)
+            # Compute is_ace directly without nested conditionals
+            card_rank = self._get_card_rank(card_id)
+            is_ace = jnp.where(is_empty | is_joker, 0.0, (card_rank == 0).astype(jnp.float32))
             
             obs = obs.at[base_idx:base_idx+6].set(jnp.array([
-                value, rank, suit, float(is_joker), is_ace, float(is_empty)
+                value, rank, suit, is_joker.astype(jnp.float32), is_ace, is_empty.astype(jnp.float32)
             ]))
         
         # Enemy info (4 features)
         obs = obs.at[30:34].set(jnp.array([
             state.current_enemy_health / 40.0,
             state.current_enemy_attack / 20.0,
-            float(state.current_enemy_id != self.EMPTY_CARD),
+            (state.current_enemy_id != self.EMPTY_CARD).astype(jnp.float32),
             self._get_card_suit(state.current_enemy_id) / 4.0
         ]))
         
@@ -473,9 +486,9 @@ class JaxMARLRegicide(MultiAgentEnv):
             state.tavern_size / 50.0,
             state.castle_size / 12.0,
             state.hospital_size / 12.0,
-            float(state.joker_cancels_immunity),
+            state.joker_cancels_immunity.astype(jnp.float32),
             state.damage_to_defend / 20.0,
-            float(state.defend_player_idx == player_idx)
+            (state.defend_player_idx == player_idx).astype(jnp.float32)
         ]))
         
         # Context (6 features)
@@ -487,9 +500,9 @@ class JaxMARLRegicide(MultiAgentEnv):
         obs = obs.at[42:48].set(jnp.array([
             hand_size / 8.0,
             avg_value,
-            float(state.status == 1),  # Awaiting defense
-            float(state.status == 2),  # Awaiting jester choice
-            float(player_idx == state.current_player),
+            (state.status == 1).astype(jnp.float32),  # Awaiting defense
+            (state.status == 2).astype(jnp.float32),  # Awaiting jester choice
+            (player_idx == state.current_player).astype(jnp.float32),
             state.step / self.max_steps
         ]))
         
